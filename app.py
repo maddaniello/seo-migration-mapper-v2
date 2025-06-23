@@ -306,7 +306,6 @@ from urllib.parse import urlparse
 import openpyxl
 import psutil
 import os
-from concurrent.futures import ThreadPoolExecutor
 import math
 
 # Configure page
