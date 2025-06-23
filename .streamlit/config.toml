@@ -1,0 +1,34 @@
+[server]
+# Increase max upload size to 1GB
+maxUploadSize = 1024
+
+# Increase max message size for large data processing
+maxMessageSize = 1000
+
+# Enable CORS for all origins (adjust for production)
+enableCORS = false
+
+# Enable WebSocket compression
+enableWebsocketCompression = true
+
+[browser]
+# Gather usage stats
+gatherUsageStats = false
+
+[runner]
+# Increase memory limit
+magicEnabled = true
+
+# Fast rerun for development
+fastReruns = true
+
+[client]
+# Show error details
+showErrorDetails = true
+
+[global]
+# Suppress deprecation warnings
+suppressDeprecationWarnings = true
+
+# Data frame serialization method
+dataFrameSerialization = "arrow"
