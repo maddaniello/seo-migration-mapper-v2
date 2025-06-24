@@ -149,35 +149,54 @@ class URLMigrationMapper:
         
         try:
             progress_bar = st.progress(0)
+            st.info("🤖 AI sta analizzando URL semanticamente...")
             
             for i, source_url in enumerate(unmatched_sources[:max_ai_matches]):
                 progress_bar.progress((i + 1) / max_ai_matches)
                 
                 prompt = f"""
-                Trova la migliore corrispondenza per questa URL sorgente nella lista target.
+                Analizza questa URL sorgente e trova la migliore corrispondenza semantica nella lista target.
                 
                 URL Sorgente: {source_url}
                 
-                URL Target (prime 20): {targets[:20]}
+                URL Target disponibili: {targets[:15]}
                 
-                Rispondi solo con l'URL target più simile o "NO_MATCH".
+                Criteri di valutazione:
+                1. Struttura del path dell'URL (es: /products/ -> /prodotti/)
+                2. Parole chiave semantiche (es: "about" -> "chi-siamo")
+                3. Gerarchia delle sezioni (es: /blog/news/ -> /notizie/)
+                4. Contenuto implicito (es: /contact -> /contatti)
+                
+                Rispondi SOLO con l'URL target più simile semanticamente.
+                Se nessuna corrispondenza è logica, rispondi "NO_MATCH".
+                
+                Esempi:
+                - /about-us/ -> /chi-siamo/
+                - /products/shoes/ -> /prodotti/scarpe/
+                - /contact-form/ -> /contatti/
                 """
                 
                 response = self.openai_client.chat.completions.create(
                     model="gpt-3.5-turbo",
                     messages=[{"role": "user", "content": prompt}],
-                    max_tokens=100,
-                    temperature=0.1
+                    max_tokens=150,
+                    temperature=0.2  # Più deterministica
                 )
                 
                 suggested_match = response.choices[0].message.content.strip()
-                if suggested_match != "NO_MATCH" and suggested_match in targets:
-                    ai_matches[source_url] = suggested_match
                 
-                time.sleep(0.1)
+                # Validazione più rigorosa
+                if (suggested_match != "NO_MATCH" and 
+                    suggested_match in targets and 
+                    suggested_match != source_url):  # Evita auto-match
+                    ai_matches[source_url] = suggested_match
+                    st.success(f"🎯 AI Match: {source_url} → {suggested_match}")
+                
+                time.sleep(0.2)  # Rate limiting più conservativo
                 
         except Exception as e:
             st.warning(f"Errore durante il matching AI: {str(e)}")
+            st.info("💡 L'AI Enhancement richiede una API key OpenAI valida e crediti disponibili")
         
         return ai_matches
     
@@ -541,12 +560,31 @@ def main():
     # Configurazione OpenAI
     st.sidebar.subheader("🤖 AI Enhancement")
     use_ai = st.sidebar.checkbox("Abilita AI Enhancement")
-    openai_api_key = ""
     
     if use_ai:
+        st.sidebar.info("""
+        **Come funziona l'AI Enhancement:**
+        
+        🎯 **Analisi semantica** delle URL non matchate
+        
+        📝 **Esempi di matching intelligente:**
+        - `/about-us/` → `/chi-siamo/`
+        - `/products/shoes/` → `/prodotti/scarpe/`
+        - `/contact-form/` → `/contatti/`
+        
+        ⚡ **Quando è utile:**
+        - Migrazioni multilingua
+        - Ristrutturazioni URL
+        - Cambi di naming convention
+        
+        💰 **Costi:** ~$0.001 per URL processata
+        """)
+        
         openai_api_key = st.sidebar.text_input("OpenAI API Key", type="password")
         if not openai_api_key:
             st.sidebar.warning("Inserisci la tua API Key OpenAI")
+    else:
+        openai_api_key = ""
     
     # Inizializza il mapper
     mapper = URLMigrationMapper()
@@ -626,7 +664,7 @@ def main():
                 extra_columns = st.multiselect(
                     "Seleziona colonne aggiuntive per il matching:",
                     options=sorted(common_extra_cols),
-                    default=suggested_cols[:3] if suggested_cols else [],
+                    default=[],  # Nessuna selezione di default
                     help="""
                     Queste colonne saranno utilizzate insieme a URL, Title e H1 per il matching.
                     Più colonne aggiungi, più preciso sarà il matching ma più lenta l'elaborazione.
