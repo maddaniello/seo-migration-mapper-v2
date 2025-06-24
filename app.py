@@ -279,62 +279,72 @@ class URLMigrationMapper:
             if col in df_staging.columns:
                 lookup_tables[col] = df_staging[[col, 'Address']].drop_duplicates(col)
         
-        # Merge base con URL
+        # Merge base con URL - SEMPLIFICATO
         print("Merge dei dati di matching...")
         
         if not df_pf_url.empty:
-            df_final = pd.merge(df_live, df_pf_url, left_on="Address", right_on="From (Address)", how="inner")
+            df_final = pd.merge(df_live, df_pf_url, left_on="Address", right_on="From (Address)", how="left")
         else:
             df_final = df_live.copy()
             df_final['URL Similarity'] = 0
             df_final['From (Address)'] = df_final['Address']
             df_final['To Address'] = ''
         
-        # Merge Title
+        # Merge Title - SEMPLIFICATO
         if not df_pf_title.empty and not lookup_tables['Title 1'].empty:
             df_pf_title_merge = pd.merge(df_pf_title, lookup_tables['Title 1'], left_on="To Title", right_on="Title 1", how="inner")
-            df_final = df_final.merge(df_pf_title_merge.drop_duplicates('Title 1'), how='left', left_on='Title 1', right_on="From (Title)")
+            # Rinomina per evitare conflitti
+            df_pf_title_merge = df_pf_title_merge.rename(columns={'Address': 'Title_Match_URL'})
+            df_final = pd.merge(df_final, df_pf_title_merge[['From (Title)', 'Title Similarity', 'To Title', 'Title_Match_URL']], 
+                              left_on='Title 1', right_on='From (Title)', how='left')
         else:
             df_final['Title Similarity'] = 0
             df_final['From (Title)'] = df_final.get('Title 1', '')
             df_final['To Title'] = ''
-            df_final['Address_y'] = ''
+            df_final['Title_Match_URL'] = ''
         
-        # Merge H1
+        # Merge H1 - SEMPLIFICATO
         if not df_pf_h1.empty and not lookup_tables['H1-1'].empty:
             df_pf_h1_merge = pd.merge(df_pf_h1, lookup_tables['H1-1'], left_on="To H1", right_on="H1-1", how="inner")
-            df_final = df_final.merge(df_pf_h1_merge.drop_duplicates('H1-1'), how='left', left_on='H1-1', right_on="From (H1)")
+            # Rinomina per evitare conflitti
+            df_pf_h1_merge = df_pf_h1_merge.rename(columns={'Address': 'H1_Match_URL'})
+            df_final = pd.merge(df_final, df_pf_h1_merge[['From (H1)', 'H1 Similarity', 'To H1', 'H1_Match_URL']], 
+                              left_on='H1-1', right_on='From (H1)', how='left')
         else:
             df_final['H1 Similarity'] = 0
             df_final['From (H1)'] = df_final.get('H1-1', '')
             df_final['To H1'] = ''
-            if 'Address' not in df_final.columns:
-                df_final['Address'] = ''
+            df_final['H1_Match_URL'] = ''
         
-        # Merge colonne extra
+        # Merge colonne extra - SEMPLIFICATO
+        extra_match_urls = {}
         for col in extra_columns:
             if col in extra_match_dfs and col in lookup_tables:
                 extra_merge = pd.merge(extra_match_dfs[col], lookup_tables[col], left_on=f"To {col}", right_on=col, how="inner")
-                df_final = df_final.merge(extra_merge.drop_duplicates(col), how='left', left_on=col, right_on=f"From ({col})")
+                # Rinomina per evitare conflitti
+                extra_merge = extra_merge.rename(columns={'Address': f'{col}_Match_URL'})
+                df_final = pd.merge(df_final, extra_merge[[f'From ({col})', f'{col} Similarity', f'To {col}', f'{col}_Match_URL']], 
+                                  left_on=col, right_on=f'From ({col})', how='left')
+                extra_match_urls[col] = f'{col}_Match_URL'
             else:
                 df_final[f'{col} Similarity'] = 0
                 df_final[f'From ({col})'] = df_final.get(col, '')
                 df_final[f'To {col}'] = ''
+                df_final[f'{col}_Match_URL'] = ''
+                extra_match_urls[col] = f'{col}_Match_URL'
         
-        # Rinomina colonne
-        rename_dict = {
-            "Address_x": "URL - Source",
-            "To Address": "URL - URL Match",
-            "Address_y": "URL - Title Match",
-            "Address": "URL - H1 Match",
-        }
+        # Rinomina colonne per output finale - SEMPLIFICATO
+        df_final = df_final.rename(columns={
+            'Address': 'URL - Source',
+            'To Address': 'URL - URL Match',
+            'Title_Match_URL': 'URL - Title Match',
+            'H1_Match_URL': 'URL - H1 Match'
+        })
         
-        # Aggiungi rename per colonne extra
-        for i, col in enumerate(extra_columns):
-            if f'Address_{["", "_x", "_y"][min(i+2, 2)]}' in df_final.columns:
-                rename_dict[f'Address_{["", "_x", "_y"][min(i+2, 2)]}'] = f"URL - {col} Match"
-        
-        df_final.rename(columns=rename_dict, inplace=True)
+        # Rinomina colonne extra
+        for col in extra_columns:
+            if f'{col}_Match_URL' in df_final.columns:
+                df_final = df_final.rename(columns={f'{col}_Match_URL': f'URL - {col} Match'})
         
         print("Calcolo dei match migliori...")
         
@@ -353,7 +363,7 @@ class URLMigrationMapper:
         # Get the max value across all similarity columns
         df_final['Best Match On'] = df_final[similarity_cols].idxmax(axis=1)
         
-        # Calcolo Highest Match Similarity e Best Matching URL
+        # Calcolo Highest Match Similarity e Best Matching URL - SEMPLIFICATO
         for col in similarity_cols:
             mask = df_final['Best Match On'] == col
             df_final.loc[mask, 'Highest Match Similarity'] = df_final.loc[mask, col]
@@ -378,6 +388,7 @@ class URLMigrationMapper:
                 df_final.loc[mask, 'Highest Match Source Text'] = df_final.loc[mask, f'From ({col_name})']
                 df_final.loc[mask, 'Highest Match Destination Text'] = df_final.loc[mask, f'To {col_name}']
         
+        # Rimuovi duplicati
         df_final.drop_duplicates(subset="URL - Source", inplace=True)
         
         # Calcolo SECONDO match migliore
