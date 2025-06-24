@@ -1,6 +1,4 @@
-st.success("✅ File caricati e validati con successo!")
-            
-            import streamlit as st
+import streamlit as st
 import pandas as pd
 import numpy as np
 import time
@@ -110,7 +108,7 @@ class URLMigrationMapper:
     
     def chunked_polyfuzz_matching(self, source_list: List[str], target_list: List[str], 
                                  match_type: str = "URL") -> pd.DataFrame:
-        """Esegue il matching PolyFuzz in chunk - STRUTTURA ORIGINALE"""
+        """Esegue il matching PolyFuzz in chunk"""
         st.info(f"🔄 Processando {match_type} matching...")
         
         all_matches = []
@@ -146,7 +144,7 @@ class URLMigrationMapper:
         if not self.openai_client or len(unmatched_sources) == 0:
             return {}
         
-        max_ai_matches = min(20, len(unmatched_sources))  # Ridotto per costi
+        max_ai_matches = min(20, len(unmatched_sources))
         ai_matches = {}
         
         try:
@@ -185,7 +183,7 @@ class URLMigrationMapper:
     
     def process_migration_mapping(self, df_live: pd.DataFrame, df_staging: pd.DataFrame, 
                                 extra_columns: List[str] = None, use_ai: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Processo principale - CON OUTPUT COMPLETO COME ORIGINALE"""
+        """Processo principale con output completo"""
         
         start_time = time.time()
         extra_columns = extra_columns or []
@@ -197,7 +195,7 @@ class URLMigrationMapper:
         - **Colonne extra per matching**: {extra_columns if extra_columns else 'Nessuna'}
         """)
         
-        # Preprocessing SEMPLIFICATO - ESATTAMENTE come nel codice originale
+        # Preprocessing
         print(f"Inizio elaborazione alle {time.strftime('%H:%M:%S')}")
         
         # Converti Status Code
@@ -210,7 +208,7 @@ class URLMigrationMapper:
         
         print(f"Dopo rimozione duplicati: Live={len(df_live)} righe, Staging={len(df_staging)} righe")
         
-        # Gestione status codes ESATTAMENTE come nel codice originale
+        # Gestione status codes
         df_3xx = df_live[(df_live['Status Code'] >= 300) & (df_live['Status Code'] <= 308)]
         df_5xx = df_live[(df_live['Status Code'] >= 500) & (df_live['Status Code'] <= 599)]
         df_3xx_5xx = pd.concat([df_3xx, df_5xx])
@@ -281,10 +279,9 @@ class URLMigrationMapper:
             if col in df_staging.columns:
                 lookup_tables[col] = df_staging[[col, 'Address']].drop_duplicates(col)
         
-        # Merge ESATTAMENTE come nel codice originale
+        # Merge base con URL
         print("Merge dei dati di matching...")
         
-        # Base merge con URL
         if not df_pf_url.empty:
             df_final = pd.merge(df_live, df_pf_url, left_on="Address", right_on="From (Address)", how="inner")
         else:
@@ -324,7 +321,7 @@ class URLMigrationMapper:
                 df_final[f'From ({col})'] = df_final.get(col, '')
                 df_final[f'To {col}'] = ''
         
-        # Rinomina colonne come nel codice originale
+        # Rinomina colonne
         rename_dict = {
             "Address_x": "URL - Source",
             "To Address": "URL - URL Match",
@@ -387,7 +384,7 @@ class URLMigrationMapper:
         print("Calcolo dei match secondari...")
         df_final['Lowest Match On'] = df_final[similarity_cols].idxmin(axis=1)
         
-        # Calcolo match intermedio (quello che non è né il migliore né il peggiore)
+        # Calcolo match intermedio
         df_final['Middle Match On'] = "URL Similarity Title Similarity H1 Similarity"
         for col in extra_columns:
             df_final['Middle Match On'] = df_final['Middle Match On'] + f" {col} Similarity"
@@ -423,7 +420,7 @@ class URLMigrationMapper:
         # Rinomina Second Match On
         df_final.rename(columns={"Middle Match On": "Second Match On"}, inplace=True)
         
-        # Check if both url recommendations are the same (Double Matched)
+        # Check if both url recommendations are the same
         df_final["Double Matched?"] = df_final['Best Matching URL'].str.lower() == df_final['Second Highest Match'].str.lower()
         
         # Rinomina Best Match On per output finale
@@ -448,7 +445,7 @@ class URLMigrationMapper:
             
             if unmatched_urls:
                 ai_matches = self.ai_enhanced_matching(
-                    unmatched_urls[:20],  # Limita per costi
+                    unmatched_urls[:20],
                     df_staging['Address'].tolist()
                 )
                 
@@ -460,7 +457,7 @@ class URLMigrationMapper:
                     df_final.loc[mask, 'Highest Match Source Text'] = source_url
                     df_final.loc[mask, 'Highest Match Destination Text'] = target_url
         
-        # Set delle colonne finali come nel file originale
+        # Set delle colonne finali
         final_columns = [
             "URL - Source",
             "Status Code", 
@@ -517,9 +514,11 @@ def main():
     
     Funzionalità:
     - 🔄 Matching intelligente basato su URL, Title e H1
+    - 🎯 Colonne personalizzabili per matching aggiuntivo
     - 🤖 Enhancement con AI (OpenAI) - opzionale
     - 📊 Supporto per file di grandi dimensioni
     - 📈 Dashboard con metriche e visualizzazioni
+    - 📋 Output completo con Second Match e Double Matched
     """)
     
     # Sidebar per configurazioni
@@ -616,7 +615,7 @@ def main():
                 extra_columns = st.multiselect(
                     "Seleziona colonne aggiuntive per il matching:",
                     options=sorted(common_extra_cols),
-                    default=suggested_cols[:3] if suggested_cols else [],  # Pre-seleziona le prime 3 consigliate
+                    default=suggested_cols[:3] if suggested_cols else [],
                     help="""
                     Queste colonne saranno utilizzate insieme a URL, Title e H1 per il matching.
                     Più colonne aggiungi, più preciso sarà il matching ma più lenta l'elaborazione.
@@ -684,10 +683,23 @@ def main():
                             )
                             st.plotly_chart(fig_pie, use_container_width=True)
                 
-                # Preview risultati
+                # Preview risultati con filtri
                 st.subheader("👀 Preview Risultati")
-                preview_df = df_final.head(25)
-                st.dataframe(preview_df, use_container_width=True)
+                
+                # Filtri
+                col1, col2 = st.columns(2)
+                with col1:
+                    min_sim_filter = st.slider("Similarità minima per preview", 0.0, 1.0, min_similarity)
+                with col2:
+                    max_rows_preview = st.selectbox("Righe da mostrare", [10, 25, 50, 100], index=1)
+                
+                # Applica filtri
+                filtered_df = df_final[df_final['Highest Match Similarity'] >= min_sim_filter].head(max_rows_preview)
+                
+                if len(filtered_df) > 0:
+                    st.dataframe(filtered_df, use_container_width=True)
+                else:
+                    st.info("Nessun risultato con la soglia di similarità selezionata.")
                 
                 # Download
                 st.header("💾 Download Risultati")
@@ -721,6 +733,15 @@ def main():
     
     else:
         st.info("👆 Carica entrambi i file CSV per iniziare l'elaborazione.")
+    
+    # Footer
+    st.markdown("---")
+    st.markdown("""
+    <div style='text-align: center; color: #666;'>
+        <p>🔗 URL Migration Mapper | Sviluppato per ottimizzare le migrazioni SEO</p>
+        <p>💡 <strong>Funzionalità principali:</strong> Matching intelligente, Colonne personalizzabili, AI Enhancement, Output completo</p>
+    </div>
+    """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
