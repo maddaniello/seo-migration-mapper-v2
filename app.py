@@ -1,8 +1,4 @@
-# Lista di encoding da provare in ordine di priorità
-            encodings_to_try = [encoding, 'utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
-            
-            # Rimuovi duplicati mantenendo l'ordine
-            encodings_to_try = list(dict.fromkeys(encodings_to_try))import streamlit as st
+import streamlit as st
 import pandas as pd
 import numpy as np
 import time
@@ -18,6 +14,7 @@ import plotly.graph_objects as go
 from datetime import datetime
 import json
 import base64
+import chardet
 
 # Configurazione pagina
 st.set_page_config(
@@ -79,8 +76,6 @@ class URLMigrationMapper:
     
     def detect_encoding(self, file_content: bytes) -> str:
         """Rileva automaticamente l'encoding del file"""
-        import chardet
-        
         # Usa chardet per rilevare l'encoding
         result = chardet.detect(file_content)
         detected_encoding = result.get('encoding', 'utf-8')
@@ -98,43 +93,6 @@ class URLMigrationMapper:
         
         return detected_encoding
     
-    def validate_csv_structure(self, df: pd.DataFrame, file_type: str) -> Tuple[bool, List[str]]:
-        """Valida la struttura del CSV caricato"""
-        required_columns = ['Address', 'Status Code', 'Title 1', 'H1-1']
-        missing_columns = []
-        warnings = []
-        
-        # Controlla colonne obbligatorie
-        for col in required_columns:
-            if col not in df.columns:
-                missing_columns.append(col)
-        
-        # Controlli specifici per tipo di file
-        if file_type.lower() == 'staging' and 'Indexability' not in df.columns:
-            warnings.append("Colonna 'Indexability' non trovata (opzionale)")
-        
-        # Controlli sulla qualità dei dati
-        if 'Address' in df.columns:
-            empty_addresses = df['Address'].isna().sum()
-            if empty_addresses > 0:
-                warnings.append(f"Trovate {empty_addresses} righe con Address vuoto")
-        
-        if 'Status Code' in df.columns:
-            try:
-                pd.to_numeric(df['Status Code'], errors='coerce')
-            except:
-                warnings.append("Alcuni Status Code non sono numerici")
-        
-        # Controllo duplicati
-        if 'Address' in df.columns:
-            duplicates = df['Address'].duplicated().sum()
-            if duplicates > 0:
-                warnings.append(f"Trovati {duplicates} URL duplicati (verranno rimossi)")
-        
-        is_valid = len(missing_columns) == 0
-        
-        return is_valid, missing_columns, warnings
-
     def load_csv_file(self, uploaded_file, filename: str, manual_encoding=None, manual_separator=None, skip_rows=0) -> pd.DataFrame:
         """Carica un file CSV gestendo diversi encoding e parametri"""
         try:
@@ -145,6 +103,12 @@ class URLMigrationMapper:
             # Rileva l'encoding
             encoding = self.detect_encoding(file_content)
             st.info(f"📄 Encoding rilevato per {filename}: {encoding}")
+            
+            # Lista di encoding da provare in ordine di priorità
+            encodings_to_try = [encoding, 'utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+            
+            # Rimuovi duplicati mantenendo l'ordine
+            encodings_to_try = list(dict.fromkeys(encodings_to_try))
             
             # Se specificato encoding manuale, usalo per primo
             if manual_encoding and manual_encoding != "Auto":
@@ -178,7 +142,7 @@ class URLMigrationMapper:
                         # Prima prova con engine C (più veloce)
                         df = pd.read_csv(uploaded_file, engine='c', **read_params)
                     except Exception:
-                        # Se engine C fallisce, usa engine Python senza low_memory
+                        # Se engine C fallisce, usa engine Python
                         uploaded_file.seek(0)
                         df = pd.read_csv(uploaded_file, engine='python', **read_params)
                     
@@ -240,7 +204,44 @@ class URLMigrationMapper:
             """)
             
             return None
-
+    
+    def validate_csv_structure(self, df: pd.DataFrame, file_type: str) -> Tuple[bool, List[str], List[str]]:
+        """Valida la struttura del CSV caricato"""
+        required_columns = ['Address', 'Status Code', 'Title 1', 'H1-1']
+        missing_columns = []
+        warnings = []
+        
+        # Controlla colonne obbligatorie
+        for col in required_columns:
+            if col not in df.columns:
+                missing_columns.append(col)
+        
+        # Controlli specifici per tipo di file
+        if file_type.lower() == 'staging' and 'Indexability' not in df.columns:
+            warnings.append("Colonna 'Indexability' non trovata (opzionale)")
+        
+        # Controlli sulla qualità dei dati
+        if 'Address' in df.columns:
+            empty_addresses = df['Address'].isna().sum()
+            if empty_addresses > 0:
+                warnings.append(f"Trovate {empty_addresses} righe con Address vuoto")
+        
+        if 'Status Code' in df.columns:
+            try:
+                pd.to_numeric(df['Status Code'], errors='coerce')
+            except:
+                warnings.append("Alcuni Status Code non sono numerici")
+        
+        # Controllo duplicati
+        if 'Address' in df.columns:
+            duplicates = df['Address'].duplicated().sum()
+            if duplicates > 0:
+                warnings.append(f"Trovati {duplicates} URL duplicati (verranno rimossi)")
+        
+        is_valid = len(missing_columns) == 0
+        
+        return is_valid, missing_columns, warnings
+    
     def get_file_info(self, df: pd.DataFrame) -> Dict:
         """Ottiene informazioni sul file caricato"""
         return {
@@ -249,6 +250,35 @@ class URLMigrationMapper:
             "memory_usage": df.memory_usage(deep=True).sum() / 1024**2,  # MB
             "column_names": list(df.columns)
         }
+    
+    def clean_dataframe_for_matching(self, df: pd.DataFrame, file_type: str) -> pd.DataFrame:
+        """Pulisce il dataframe per il matching rimuovendo colonne problematiche"""
+        
+        # Mostra info sulle colonne originali
+        st.info(f"📊 {file_type} - Colonne originali: {len(df.columns)}")
+        
+        # Lista delle colonne essenziali da mantenere
+        essential_columns = [
+            'Address', 'Status Code', 'Title 1', 'H1-1', 
+            'Meta Description 1', 'Canonical Link Element 1',
+            'Indexability', 'Content Type'
+        ]
+        
+        # Mantieni solo le colonne che esistono
+        columns_to_keep = [col for col in essential_columns if col in df.columns]
+        
+        # Aggiungi eventuali colonne extra specificate dall'utente
+        extra_cols = getattr(self, 'extra_columns', [])
+        for col in extra_cols:
+            if col in df.columns and col not in columns_to_keep:
+                columns_to_keep.append(col)
+        
+        # Filtra il dataframe
+        df_cleaned = df[columns_to_keep].copy()
+        
+        st.success(f"✅ {file_type} - Colonne mantenute: {len(df_cleaned.columns)}")
+        
+        return df_cleaned
     
     def preprocess_dataframe(self, df: pd.DataFrame, required_columns: List[str]) -> pd.DataFrame:
         """Preprocessa il dataframe con ottimizzazioni per la memoria"""
@@ -373,35 +403,6 @@ class URLMigrationMapper:
         
         return final_matches
     
-    def clean_dataframe_for_matching(self, df: pd.DataFrame, file_type: str) -> pd.DataFrame:
-        """Pulisce il dataframe per il matching rimuovendo colonne problematiche"""
-        
-        # Mostra info sulle colonne originali
-        st.info(f"📊 {file_type} - Colonne originali: {len(df.columns)}")
-        
-        # Lista delle colonne essenziali da mantenere
-        essential_columns = [
-            'Address', 'Status Code', 'Title 1', 'H1-1', 
-            'Meta Description 1', 'Canonical Link Element 1',
-            'Indexability', 'Content Type'
-        ]
-        
-        # Mantieni solo le colonne che esistono
-        columns_to_keep = [col for col in essential_columns if col in df.columns]
-        
-        # Aggiungi eventuali colonne extra specificate dall'utente
-        extra_cols = getattr(self, 'extra_columns', [])
-        for col in extra_cols:
-            if col in df.columns and col not in columns_to_keep:
-                columns_to_keep.append(col)
-        
-        # Filtra il dataframe
-        df_cleaned = df[columns_to_keep].copy()
-        
-        st.success(f"✅ {file_type} - Colonne mantenute: {len(df_cleaned.columns)}")
-        
-        return df_cleaned
-
     def process_migration_mapping(self, df_live: pd.DataFrame, df_staging: pd.DataFrame, 
                                 extra_columns: List[str] = None, use_ai: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Processo principale di mapping delle URL"""
@@ -423,19 +424,6 @@ class URLMigrationMapper:
         - **Live**: {live_info['rows']:,} righe, {live_info['memory_usage']:.1f} MB
         - **Staging**: {staging_info['rows']:,} righe, {staging_info['memory_usage']:.1f} MB
         """)
-        
-        # Preprocessing
-        required_cols = ['Address', 'Status Code', 'Title 1', 'H1-1'] + extra_columns
-        
-        # Filtra solo le colonne disponibili
-        available_live_cols = [col for col in required_cols if col in df_live.columns]
-        available_staging_cols = [col for col in required_cols if col in df_staging.columns]
-        
-        if 'Indexability' in df_staging.columns:
-            available_staging_cols.append('Indexability')
-        
-        df_live = df_live[available_live_cols].copy()
-        df_staging = df_staging[available_staging_cols].copy()
         
         # Preprocessing con gestione migliorata delle colonne
         df_live = self.preprocess_dataframe(df_live, extra_columns)
