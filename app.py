@@ -1,4 +1,6 @@
-import streamlit as st
+st.success("✅ File caricati e validati con successo!")
+            
+            import streamlit as st
 import pandas as pd
 import numpy as np
 import time
@@ -183,7 +185,7 @@ class URLMigrationMapper:
     
     def process_migration_mapping(self, df_live: pd.DataFrame, df_staging: pd.DataFrame, 
                                 extra_columns: List[str] = None, use_ai: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Processo principale - STRUTTURA ORIGINALE SEMPLIFICATA"""
+        """Processo principale - CON OUTPUT COMPLETO COME ORIGINALE"""
         
         start_time = time.time()
         extra_columns = extra_columns or []
@@ -192,6 +194,7 @@ class URLMigrationMapper:
         📊 **Informazioni sui file:**
         - **Live**: {len(df_live):,} righe, {len(df_live.columns)} colonne
         - **Staging**: {len(df_staging):,} righe, {len(df_staging.columns)} colonne
+        - **Colonne extra per matching**: {extra_columns if extra_columns else 'Nessuna'}
         """)
         
         # Preprocessing SEMPLIFICATO - ESATTAMENTE come nel codice originale
@@ -219,84 +222,223 @@ class URLMigrationMapper:
         
         print(f"URL processabili: {len(df_live)} righe")
         
-        # Gestione valori mancanti ESATTAMENTE come nel codice originale
-        df_live["Title 1"] = df_live["Title 1"].fillna(df_live["Address"])
-        df_live["H1-1"] = df_live["H1-1"].fillna(df_live["Address"])
-        df_staging["Title 1"] = df_staging["Title 1"].fillna(df_staging["Address"])
-        df_staging["H1-1"] = df_staging["H1-1"].fillna(df_staging["Address"])
+        # Gestione valori mancanti per tutte le colonne
+        columns_to_fill = ['Title 1', 'H1-1'] + extra_columns
+        for col in columns_to_fill:
+            if col in df_live.columns:
+                df_live[col] = df_live[col].fillna(df_live["Address"])
+            if col in df_staging.columns:
+                df_staging[col] = df_staging[col].fillna(df_staging["Address"])
         
-        # MATCHING ESATTAMENTE come nel codice originale
-        print("Inizio matching degli URL...")
-        df_pf_url = self.chunked_polyfuzz_matching(
-            list(df_live["Address"]), 
-            list(df_staging["Address"]), 
-            match_type="URL"
-        )
+        # MATCHING con colonne personalizzabili
+        matching_columns = ['Address', 'Title 1', 'H1-1'] + extra_columns
+        match_results = {}
         
-        print("Inizio matching dei titoli...")
-        df_pf_title = self.chunked_polyfuzz_matching(
-            list(df_live["Title 1"]), 
-            list(df_staging["Title 1"]), 
-            match_type="Title"
-        )
+        for col in matching_columns:
+            if col in df_live.columns and col in df_staging.columns:
+                print(f"Inizio matching per: {col}")
+                match_results[col] = self.chunked_polyfuzz_matching(
+                    list(df_live[col].dropna()), 
+                    list(df_staging[col].dropna()), 
+                    match_type=col
+                )
         
-        print("Inizio matching degli H1...")
-        df_pf_h1 = self.chunked_polyfuzz_matching(
-            list(df_live["H1-1"]), 
-            list(df_staging["H1-1"]), 
-            match_type="H1"
-        )
+        # Rinomina colonne per ogni match result
+        df_pf_url = match_results.get('Address', pd.DataFrame())
+        df_pf_title = match_results.get('Title 1', pd.DataFrame())
+        df_pf_h1 = match_results.get('H1-1', pd.DataFrame())
         
-        # Rinomina colonne ESATTAMENTE come nel codice originale
-        df_pf_url.rename(columns={"Similarity": "URL Similarity", "From": "From (Address)", "To": "To Address"}, inplace=True)
-        df_pf_title.rename(columns={"Similarity": "Title Similarity", "From": "From (Title)", "To": "To Title"}, inplace=True)
-        df_pf_h1.rename(columns={"Similarity": "H1 Similarity", "From": "From (H1)", "To": "To H1"}, inplace=True)
+        # Rename come nel codice originale
+        if not df_pf_url.empty:
+            df_pf_url.rename(columns={"Similarity": "URL Similarity", "From": "From (Address)", "To": "To Address"}, inplace=True)
+        if not df_pf_title.empty:
+            df_pf_title.rename(columns={"Similarity": "Title Similarity", "From": "From (Title)", "To": "To Title"}, inplace=True)
+        if not df_pf_h1.empty:
+            df_pf_h1.rename(columns={"Similarity": "H1 Similarity", "From": "From (H1)", "To": "To H1"}, inplace=True)
+        
+        # Gestione colonne extra
+        extra_match_dfs = {}
+        for col in extra_columns:
+            if col in match_results and not match_results[col].empty:
+                extra_df = match_results[col].copy()
+                extra_df.rename(columns={
+                    "Similarity": f"{col} Similarity", 
+                    "From": f"From ({col})", 
+                    "To": f"To {col}"
+                }, inplace=True)
+                extra_match_dfs[col] = extra_df
         
         print("Preparazione merge dei risultati...")
         
-        # Preparazione merge ESATTAMENTE come nel codice originale
-        df_new_title = df_staging[['Title 1', 'Address']].drop_duplicates('Title 1')
-        df_new_h1 = df_staging[['H1-1', 'Address']].drop_duplicates('H1-1')
+        # Preparazione lookup tables
+        lookup_tables = {
+            'Title 1': df_staging[['Title 1', 'Address']].drop_duplicates('Title 1') if 'Title 1' in df_staging.columns else pd.DataFrame(),
+            'H1-1': df_staging[['H1-1', 'Address']].drop_duplicates('H1-1') if 'H1-1' in df_staging.columns else pd.DataFrame()
+        }
+        
+        # Lookup per colonne extra
+        for col in extra_columns:
+            if col in df_staging.columns:
+                lookup_tables[col] = df_staging[[col, 'Address']].drop_duplicates(col)
         
         # Merge ESATTAMENTE come nel codice originale
         print("Merge dei dati di matching...")
-        df_pf_title_merge = pd.merge(df_pf_title, df_new_title, left_on="To Title", right_on="Title 1", how="inner")
-        df_pf_h1_merge = pd.merge(df_pf_h1, df_new_h1, left_on="To H1", right_on="H1-1", how="inner")
         
-        # Costruzione finale ESATTAMENTE come nel codice originale
-        print("Creazione dataset finale...")
-        df_final = pd.merge(df_live, df_pf_url, left_on="Address", right_on="From (Address)", how="inner")
-        df_final = df_final.merge(df_pf_title_merge.drop_duplicates('Title 1'), how='left', left_on='Title 1', right_on="From (Title)")
-        df_final = df_final.merge(df_pf_h1_merge.drop_duplicates('H1-1'), how='left', left_on='H1-1', right_on="From (H1)")
+        # Base merge con URL
+        if not df_pf_url.empty:
+            df_final = pd.merge(df_live, df_pf_url, left_on="Address", right_on="From (Address)", how="inner")
+        else:
+            df_final = df_live.copy()
+            df_final['URL Similarity'] = 0
+            df_final['From (Address)'] = df_final['Address']
+            df_final['To Address'] = ''
         
-        # Rinomina colonne ESATTAMENTE come nel codice originale
-        df_final.rename(
-            columns={
-                "Address_x": "URL - Source",
-                "To Address": "URL - URL Match",
-                "Address_y": "URL - Title Match",
-                "Address": "URL - H1 Match",
-            },
-            inplace=True,
-        )
+        # Merge Title
+        if not df_pf_title.empty and not lookup_tables['Title 1'].empty:
+            df_pf_title_merge = pd.merge(df_pf_title, lookup_tables['Title 1'], left_on="To Title", right_on="Title 1", how="inner")
+            df_final = df_final.merge(df_pf_title_merge.drop_duplicates('Title 1'), how='left', left_on='Title 1', right_on="From (Title)")
+        else:
+            df_final['Title Similarity'] = 0
+            df_final['From (Title)'] = df_final.get('Title 1', '')
+            df_final['To Title'] = ''
+            df_final['Address_y'] = ''
+        
+        # Merge H1
+        if not df_pf_h1.empty and not lookup_tables['H1-1'].empty:
+            df_pf_h1_merge = pd.merge(df_pf_h1, lookup_tables['H1-1'], left_on="To H1", right_on="H1-1", how="inner")
+            df_final = df_final.merge(df_pf_h1_merge.drop_duplicates('H1-1'), how='left', left_on='H1-1', right_on="From (H1)")
+        else:
+            df_final['H1 Similarity'] = 0
+            df_final['From (H1)'] = df_final.get('H1-1', '')
+            df_final['To H1'] = ''
+            if 'Address' not in df_final.columns:
+                df_final['Address'] = ''
+        
+        # Merge colonne extra
+        for col in extra_columns:
+            if col in extra_match_dfs and col in lookup_tables:
+                extra_merge = pd.merge(extra_match_dfs[col], lookup_tables[col], left_on=f"To {col}", right_on=col, how="inner")
+                df_final = df_final.merge(extra_merge.drop_duplicates(col), how='left', left_on=col, right_on=f"From ({col})")
+            else:
+                df_final[f'{col} Similarity'] = 0
+                df_final[f'From ({col})'] = df_final.get(col, '')
+                df_final[f'To {col}'] = ''
+        
+        # Rinomina colonne come nel codice originale
+        rename_dict = {
+            "Address_x": "URL - Source",
+            "To Address": "URL - URL Match",
+            "Address_y": "URL - Title Match",
+            "Address": "URL - H1 Match",
+        }
+        
+        # Aggiungi rename per colonne extra
+        for i, col in enumerate(extra_columns):
+            if f'Address_{["", "_x", "_y"][min(i+2, 2)]}' in df_final.columns:
+                rename_dict[f'Address_{["", "_x", "_y"][min(i+2, 2)]}'] = f"URL - {col} Match"
+        
+        df_final.rename(columns=rename_dict, inplace=True)
         
         print("Calcolo dei match migliori...")
         
-        # Calcolo best match ESATTAMENTE come nel codice originale
+        # Calcolo best match con colonne personalizzabili
         similarity_cols = ["URL Similarity", "Title Similarity", "H1 Similarity"]
+        for col in extra_columns:
+            similarity_cols.append(f"{col} Similarity")
+        
+        # Assicurati che tutte le colonne esistano
+        for col in similarity_cols:
+            if col not in df_final.columns:
+                df_final[col] = 0
+        
         df_final[similarity_cols] = df_final[similarity_cols].fillna(0)
         
+        # Get the max value across all similarity columns
         df_final['Best Match On'] = df_final[similarity_cols].idxmax(axis=1)
         
-        # Best match logic ESATTAMENTE come nel codice originale
-        df_final.loc[df_final['Best Match On'] == "Title Similarity", 'Highest Match Similarity'] = df_final['Title Similarity']
-        df_final.loc[df_final['Best Match On'] == "Title Similarity", 'Best Matching URL'] = df_final['URL - Title Match']
-        df_final.loc[df_final['Best Match On'] == "H1 Similarity", 'Highest Match Similarity'] = df_final['H1 Similarity']
-        df_final.loc[df_final['Best Match On'] == "H1 Similarity", 'Best Matching URL'] = df_final['URL - H1 Match']
-        df_final.loc[df_final['Best Match On'] == "URL Similarity", 'Highest Match Similarity'] = df_final['URL Similarity']
-        df_final.loc[df_final['Best Match On'] == "URL Similarity", 'Best Matching URL'] = df_final['URL - URL Match']
+        # Calcolo Highest Match Similarity e Best Matching URL
+        for col in similarity_cols:
+            mask = df_final['Best Match On'] == col
+            df_final.loc[mask, 'Highest Match Similarity'] = df_final.loc[mask, col]
+            
+            # Determina URL corrispondente
+            if col == "Title Similarity":
+                df_final.loc[mask, 'Best Matching URL'] = df_final.loc[mask, 'URL - Title Match']
+                df_final.loc[mask, 'Highest Match Source Text'] = df_final.loc[mask, 'From (Title)']
+                df_final.loc[mask, 'Highest Match Destination Text'] = df_final.loc[mask, 'To Title']
+            elif col == "H1 Similarity":
+                df_final.loc[mask, 'Best Matching URL'] = df_final.loc[mask, 'URL - H1 Match']
+                df_final.loc[mask, 'Highest Match Source Text'] = df_final.loc[mask, 'From (H1)']
+                df_final.loc[mask, 'Highest Match Destination Text'] = df_final.loc[mask, 'To H1']
+            elif col == "URL Similarity":
+                df_final.loc[mask, 'Best Matching URL'] = df_final.loc[mask, 'URL - URL Match']
+                df_final.loc[mask, 'Highest Match Source Text'] = df_final.loc[mask, 'URL - Source']
+                df_final.loc[mask, 'Highest Match Destination Text'] = df_final.loc[mask, 'URL - URL Match']
+            else:
+                # Colonne extra
+                col_name = col.replace(' Similarity', '')
+                df_final.loc[mask, 'Best Matching URL'] = df_final.loc[mask, f'URL - {col_name} Match']
+                df_final.loc[mask, 'Highest Match Source Text'] = df_final.loc[mask, f'From ({col_name})']
+                df_final.loc[mask, 'Highest Match Destination Text'] = df_final.loc[mask, f'To {col_name}']
         
         df_final.drop_duplicates(subset="URL - Source", inplace=True)
+        
+        # Calcolo SECONDO match migliore
+        print("Calcolo dei match secondari...")
+        df_final['Lowest Match On'] = df_final[similarity_cols].idxmin(axis=1)
+        
+        # Calcolo match intermedio (quello che non è né il migliore né il peggiore)
+        df_final['Middle Match On'] = "URL Similarity Title Similarity H1 Similarity"
+        for col in extra_columns:
+            df_final['Middle Match On'] = df_final['Middle Match On'] + f" {col} Similarity"
+        
+        df_final['Middle Match On'] = df_final.apply(lambda x: x['Middle Match On'].replace(x['Best Match On'], ''), 1)
+        df_final['Middle Match On'] = df_final.apply(lambda x: x['Middle Match On'].replace(x['Lowest Match On'], ''), 1)
+        df_final['Middle Match On'] = df_final['Middle Match On'].str.strip()
+        
+        # Assegna Second Highest Match URL e Similarity
+        for col in similarity_cols:
+            mask = df_final['Middle Match On'] == col
+            df_final.loc[mask, 'Second Highest Match Similarity'] = df_final.loc[mask, col]
+            
+            if col == "Title Similarity":
+                df_final.loc[mask, 'Second Highest Match'] = df_final.loc[mask, 'URL - Title Match']
+                df_final.loc[mask, 'Second Match Source Text'] = df_final.loc[mask, 'From (Title)']
+                df_final.loc[mask, 'Second Match Destination Text'] = df_final.loc[mask, 'To Title']
+            elif col == "H1 Similarity":
+                df_final.loc[mask, 'Second Highest Match'] = df_final.loc[mask, 'URL - H1 Match']
+                df_final.loc[mask, 'Second Match Source Text'] = df_final.loc[mask, 'From (H1)']
+                df_final.loc[mask, 'Second Match Destination Text'] = df_final.loc[mask, 'To H1']
+            elif col == "URL Similarity":
+                df_final.loc[mask, 'Second Highest Match'] = df_final.loc[mask, 'URL - URL Match']
+                df_final.loc[mask, 'Second Match Source Text'] = df_final.loc[mask, 'URL - Source']
+                df_final.loc[mask, 'Second Match Destination Text'] = df_final.loc[mask, 'URL - URL Match']
+            else:
+                # Colonne extra
+                col_name = col.replace(' Similarity', '')
+                df_final.loc[mask, 'Second Highest Match'] = df_final.loc[mask, f'URL - {col_name} Match']
+                df_final.loc[mask, 'Second Match Source Text'] = df_final.loc[mask, f'From ({col_name})']
+                df_final.loc[mask, 'Second Match Destination Text'] = df_final.loc[mask, f'To {col_name}']
+        
+        # Rinomina Second Match On
+        df_final.rename(columns={"Middle Match On": "Second Match On"}, inplace=True)
+        
+        # Check if both url recommendations are the same (Double Matched)
+        df_final["Double Matched?"] = df_final['Best Matching URL'].str.lower() == df_final['Second Highest Match'].str.lower()
+        
+        # Rinomina Best Match On per output finale
+        df_final['Best Match On'] = df_final['Best Match On'].str.replace("Title Similarity", "Page Title")
+        df_final['Best Match On'] = df_final['Best Match On'].str.replace("H1 Similarity", "H1 Heading")
+        df_final['Best Match On'] = df_final['Best Match On'].str.replace("URL Similarity", "URL")
+        for col in extra_columns:
+            df_final['Best Match On'] = df_final['Best Match On'].str.replace(f"{col} Similarity", col)
+        
+        # Rinomina Second Match On per output finale
+        df_final['Second Match On'] = df_final['Second Match On'].str.replace("Title Similarity", "Page Title")
+        df_final['Second Match On'] = df_final['Second Match On'].str.replace("H1 Similarity", "H1 Heading")
+        df_final['Second Match On'] = df_final['Second Match On'].str.replace("URL Similarity", "URL")
+        for col in extra_columns:
+            df_final['Second Match On'] = df_final['Second Match On'].str.replace(f"{col} Similarity", col)
         
         # AI Enhancement se abilitato
         if use_ai and self.openai_client:
@@ -315,9 +457,32 @@ class URLMigrationMapper:
                     df_final.loc[mask, 'Best Matching URL'] = target_url
                     df_final.loc[mask, 'Highest Match Similarity'] = 0.95
                     df_final.loc[mask, 'Best Match On'] = 'AI Enhanced'
+                    df_final.loc[mask, 'Highest Match Source Text'] = source_url
+                    df_final.loc[mask, 'Highest Match Destination Text'] = target_url
+        
+        # Set delle colonne finali come nel file originale
+        final_columns = [
+            "URL - Source",
+            "Status Code", 
+            "Best Matching URL",
+            "Best Match On",
+            "Highest Match Similarity",
+            "Highest Match Source Text",
+            "Highest Match Destination Text",
+            "Second Highest Match",
+            "Second Match On",
+            "Second Highest Match Similarity",
+            "Second Match Source Text",
+            "Second Match Destination Text",
+            "Double Matched?",
+        ]
+        
+        # Mantieni solo le colonne che esistono
+        existing_cols = [col for col in final_columns if col in df_final.columns]
+        df_final = df_final[existing_cols]
         
         # Ordinamento finale
-        df_final.sort_values("Highest Match Similarity", ascending=False, inplace=True)
+        df_final.sort_values(["Highest Match Similarity", "Double Matched?"], ascending=[False, False], inplace=True)
         
         # Statistiche finali
         end_time = time.time()
@@ -332,6 +497,7 @@ class URLMigrationMapper:
         - ⏱️ Tempo: {total_time:.1f} secondi
         - 📊 URL processati: {len(df_final):,}
         - 🎯 Match trovati: {len(df_final[df_final['Highest Match Similarity'] > self.min_similarity_threshold]):,}
+        - 📋 Colonne output: {len(existing_cols)}
         """)
         
         return df_final, df_3xx_5xx
@@ -425,6 +591,48 @@ def main():
                 st.metric("Righe Staging", f"{len(df_staging):,}")
                 st.metric("Colonne Staging", len(df_staging.columns))
             
+            # Selezione colonne extra per matching
+            st.header("🎯 Colonne Aggiuntive per Matching")
+            
+            # Trova colonne comuni (escluse quelle base)
+            base_columns = ['Address', 'Status Code', 'Title 1', 'H1-1']
+            available_live_cols = [col for col in df_live.columns if col not in base_columns]
+            available_staging_cols = [col for col in df_staging.columns if col not in base_columns]
+            common_extra_cols = list(set(available_live_cols) & set(available_staging_cols))
+            
+            # Suggerimenti di colonne utili per SEO
+            suggested_cols = []
+            for col in ['Meta Description 1', 'Canonical Link Element 1', 'Content Type', 'H2-1', 'Meta Keywords 1']:
+                if col in common_extra_cols:
+                    suggested_cols.append(col)
+            
+            if common_extra_cols:
+                st.info(f"**Colonne disponibili per matching:** {len(common_extra_cols)}")
+                
+                if suggested_cols:
+                    st.markdown(f"**💡 Colonne consigliate per SEO:** {', '.join(suggested_cols)}")
+                
+                # Multiselect per colonne extra
+                extra_columns = st.multiselect(
+                    "Seleziona colonne aggiuntive per il matching:",
+                    options=sorted(common_extra_cols),
+                    default=suggested_cols[:3] if suggested_cols else [],  # Pre-seleziona le prime 3 consigliate
+                    help="""
+                    Queste colonne saranno utilizzate insieme a URL, Title e H1 per il matching.
+                    Più colonne aggiungi, più preciso sarà il matching ma più lenta l'elaborazione.
+                    """
+                )
+                
+                if extra_columns:
+                    st.success(f"✅ Colonne selezionate: {', '.join(extra_columns)}")
+                else:
+                    st.info("ℹ️ Nessuna colonna aggiuntiva selezionata. Verrà usato solo URL, Title e H1.")
+                    
+            else:
+                extra_columns = []
+                st.warning("⚠️ Nessuna colonna aggiuntiva comune trovata tra i due file.")
+                st.info("Verrà usato solo il matching base su URL, Title e H1.")
+            
             # Pulsante elaborazione
             if st.button("🚀 Avvia Elaborazione", type="primary"):
                 
@@ -434,7 +642,7 @@ def main():
                 # Elaborazione
                 with st.spinner("Elaborazione in corso..."):
                     df_final, df_non_redirectable = mapper.process_migration_mapping(
-                        df_live, df_staging, [], use_ai
+                        df_live, df_staging, extra_columns, use_ai
                     )
                 
                 # Risultati
