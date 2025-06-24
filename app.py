@@ -1,57 +1,620 @@
-if "To Address" in df_final.columns:
+import streamlit as st
+import pandas as pd
+import numpy as np
+from polyfuzz import PolyFuzz
+import time
+import io
+import gc
+from typing import List, Dict, Tuple, Optional, Union
+import openai
+import json
+import re
+from urllib.parse import urlparse
+import openpyxl
+import psutil
+import os
+import math
+
+# Configure page
+st.set_page_config(
+    page_title="URL Migration Mapping Tool",
+    page_icon="🔗",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+class URLMigrationMapper:
+    def __init__(self):
+        self.df_live = None
+        self.df_staging = None
+        self.openai_client = None
+        self.required_columns = {
+            'pre': ['Address', 'Status Code'],
+            'post': ['Address', 'Status Code', 'Indexability']
+        }
+        self.optional_columns = ['Title 1', 'H1-1']
+        self.batch_size = 5000
+        self.max_memory_usage = 85
+        
+    def get_memory_usage(self) -> float:
+        """Get current memory usage percentage"""
+        return psutil.virtual_memory().percent
+    
+    def calculate_optimal_batch_size(self, total_rows: int, available_memory_gb: float = None) -> int:
+        """Calculate optimal batch size based on data size and available memory"""
+        if available_memory_gb is None:
+            available_memory_gb = psutil.virtual_memory().available / (1024**3)
+        
+        memory_per_row_mb = 0.001
+        max_rows_in_memory = int((available_memory_gb * 1024 * 0.5) / memory_per_row_mb)
+        
+        if total_rows <= max_rows_in_memory:
+            return total_rows
+        
+        num_batches = math.ceil(total_rows / max_rows_in_memory)
+        optimal_batch_size = math.ceil(total_rows / num_batches)
+        optimal_batch_size = max(1000, min(optimal_batch_size, 10000))
+        
+        return optimal_batch_size
+    
+    def setup_openai(self, api_key: str) -> bool:
+        """Setup OpenAI client"""
+        try:
+            self.openai_client = openai.OpenAI(api_key=api_key)
+            self.openai_client.models.list()
+            return True
+        except Exception as e:
+            st.error(f"Errore nella configurazione OpenAI: {str(e)}")
+            return False
+    
+    def load_file_chunked(self, uploaded_file, chunk_size: int = 10000) -> pd.DataFrame:
+        """Load large files in chunks to avoid memory issues"""
+        try:
+            file_size_mb = uploaded_file.size / (1024 * 1024)
+            st.info(f"📁 Caricamento file: {uploaded_file.name} ({file_size_mb:.1f} MB)")
+            
+            if uploaded_file.name.endswith('.csv'):
+                csv_params = {
+                    'on_bad_lines': 'skip',
+                    'sep': ',',
+                    'quotechar': '"',
+                    'skipinitialspace': True,
+                    'low_memory': False,
+                    'encoding': 'utf-8',
+                    'engine': 'python'
+                }
+                
+                encodings_to_try = ['utf-8', 'latin-1', 'cp1252']
+                
+                if file_size_mb > 100:
+                    st.info("📊 File grande rilevato - utilizzo caricamento ottimizzato")
+                    
+                    chunks = []
+                    df_loaded = False
+                    
+                    for encoding in encodings_to_try:
+                        try:
+                            csv_params['encoding'] = encoding
+                            uploaded_file.seek(0)
+                            
+                            safe_chunk_size = min(chunk_size, 5000) if file_size_mb > 500 else chunk_size
+                            
+                            chunk_iterator = pd.read_csv(uploaded_file, 
+                                                       chunksize=safe_chunk_size, 
+                                                       **csv_params)
+                            
+                            total_chunks = math.ceil(file_size_mb / 5)
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
+                            
+                            chunk_count = 0
+                            for i, chunk in enumerate(chunk_iterator):
+                                current_memory = self.get_memory_usage()
+                                if current_memory > self.max_memory_usage:
+                                    st.warning(f"⚠️ Memoria alta ({current_memory:.1f}%), consolidando chunks...")
+                                    if chunks:
+                                        break
+                                
+                                if not chunk.empty:
+                                    chunk = chunk.dropna(how='all')
+                                    if not chunk.empty:
+                                        chunks.append(chunk)
+                                        chunk_count += 1
+                                
+                                progress = min((i + 1) / total_chunks, 1.0)
+                                progress_bar.progress(progress)
+                                status_text.text(f"📦 Processati {chunk_count} chunks, memoria: {current_memory:.1f}%")
+                                
+                                if i % 10 == 0:
+                                    gc.collect()
+                            
+                            if chunks:
+                                status_text.text("🔗 Combinando chunks...")
+                                df = pd.concat(chunks, ignore_index=True, sort=False)
+                                del chunks
+                                gc.collect()
+                                df_loaded = True
+                                st.success(f"✅ File caricato con encoding: {encoding} ({chunk_count} chunks)")
+                                break
+                            else:
+                                st.warning(f"⚠️ Nessun dato valido trovato con encoding {encoding}")
+                                continue
+                            
+                        except Exception as e:
+                            if chunks:
+                                del chunks
+                                chunks = []
+                            st.warning(f"⚠️ Errore con encoding {encoding}: {str(e)[:100]}...")
+                            continue
+                    
+                    if not df_loaded:
+                        raise ValueError("Impossibile caricare il file. Troppi errori nei dati.")
+                        
+                else:
+                    df_loaded = False
+                    
+                    for encoding in encodings_to_try:
+                        try:
+                            csv_params['encoding'] = encoding
+                            uploaded_file.seek(0)
+                            df = pd.read_csv(uploaded_file, **csv_params)
+                            df_loaded = True
+                            st.success(f"✅ File caricato con encoding: {encoding}")
+                            break
+                            
+                        except Exception as e:
+                            st.warning(f"⚠️ Errore con encoding {encoding}: {str(e)[:100]}...")
+                            continue
+                    
+                    if not df_loaded:
+                        raise ValueError("Impossibile caricare il file con nessuno degli encoding testati")
+                    
+            elif uploaded_file.name.endswith(('.xlsx', '.xls')):
+                if file_size_mb > 50:
+                    st.warning("⚠️ File Excel grande rilevato. Il caricamento potrebbe richiedere tempo...")
+                
+                try:
+                    df = pd.read_excel(uploaded_file, engine='openpyxl')
+                except Exception as e:
+                    st.warning(f"⚠️ Tentativo con openpyxl fallito: {str(e)}")
+                    try:
+                        df = pd.read_excel(uploaded_file, engine='xlrd')
+                    except Exception as e2:
+                        raise ValueError(f"Impossibile caricare il file Excel: {str(e2)}")
+            else:
+                raise ValueError("Formato file non supportato")
+            
+            st.info(f"🔍 Ottimizzazione file caricato...")
+            
+            original_rows = len(df)
+            original_columns = len(df.columns)
+            
+            df = df.dropna(how='all')
+            empty_rows_removed = original_rows - len(df)
+            
+            if empty_rows_removed > 0:
+                st.info(f"🗑️ Rimosse {empty_rows_removed} righe completamente vuote")
+            
+            empty_cols = df.columns[df.isnull().all()].tolist()
+            if empty_cols:
+                df.drop(columns=empty_cols, inplace=True)
+                st.info(f"🗑️ Rimosse {len(empty_cols)} colonne completamente vuote")
+            
+            unnamed_cols = [col for col in df.columns if str(col).startswith('Unnamed:')]
+            if unnamed_cols:
+                cols_to_remove = []
+                for col in unnamed_cols:
+                    non_null_pct = df[col].notna().sum() / len(df)
+                    if non_null_pct < 0.05:
+                        cols_to_remove.append(col)
+                
+                if cols_to_remove:
+                    df.drop(columns=cols_to_remove, inplace=True)
+                    st.info(f"🗑️ Rimosse {len(cols_to_remove)} colonne 'Unnamed' quasi vuote")
+            
+            df.columns = df.columns.astype(str)
+            df.columns = [col.strip().replace('\n', ' ').replace('\r', ' ') for col in df.columns]
+            
+            if len(df) > 50000:
+                st.info("🔧 Ottimizzazione tipi di dati per file grande...")
+                
+                for col in df.columns:
+                    if df[col].dtype == 'object':
+                        unique_ratio = df[col].nunique() / len(df)
+                        if unique_ratio < 0.5:
+                            try:
+                                df[col] = df[col].astype('category')
+                            except:
+                                df[col] = df[col].astype('string')
+                        else:
+                            df[col] = df[col].astype('string')
+                
+                gc.collect()
+            
+            final_rows = len(df)
+            final_columns = len(df.columns)
+            
+            st.success(f"✅ File ottimizzato: {final_rows:,} righe, {final_columns} colonne")
+            
+            if final_rows != original_rows or final_columns != original_columns:
+                st.info(f"📊 Ottimizzazioni: {original_rows:,}→{final_rows:,} righe, {original_columns}→{final_columns} colonne")
+            
+            if len(df.columns) > 15:
+                st.info(f"🔍 Prime 15 colonne: {list(df.columns[:15])}")
+                st.info(f"📝 + altre {len(df.columns) - 15} colonne...")
+            else:
+                st.info(f"🔍 Colonne: {list(df.columns)}")
+            
+            memory_usage = df.memory_usage(deep=True).sum() / 1024 / 1024
+            st.info(f"💾 Utilizzo memoria DataFrame: {memory_usage:.1f} MB")
+            
+            return df
+            
+        except Exception as e:
+            error_msg = str(e)
+            st.error(f"❌ Errore nel caricamento del file {uploaded_file.name}")
+            st.error(f"Dettaglio errore: {error_msg}")
+            
+            if "expected" in error_msg and "saw" in error_msg:
+                st.markdown("""
+                **🔧 Problema rilevato: Colonne inconsistenti**
+                
+                **Soluzioni consigliate:**
+                1. **Apri il file in Excel** e verifica che tutte le righe abbiano lo stesso numero di colonne
+                2. **Cerca righe con virgole extra** nei contenuti (es. descrizioni, title)
+                3. **Salva come CSV UTF-8** da Excel per pulire il formato
+                4. **Rimuovi manualmente** le righe problematiche (vedi numeri sopra)
+                """)
+            elif "encoding" in error_msg.lower():
+                st.markdown("""
+                **🔧 Problema rilevato: Encoding del file**
+                
+                **Soluzioni:**
+                - Salva il file come **CSV UTF-8** da Excel
+                - Prova a convertire con un editor di testo (Notepad++, VS Code)
+                """)
+            elif "memory" in error_msg.lower():
+                st.markdown("""
+                **🔧 Problema rilevato: Memoria insufficiente**
+                
+                **Soluzioni:**
+                - Dividi il file in parti più piccole
+                - Rimuovi colonne non necessarie prima del caricamento
+                - Chiudi altre applicazioni per liberare memoria
+                """)
+            else:
+                st.markdown("""
+                **💡 Suggerimenti generali:**
+                - Verifica che il file non sia corrotto
+                - Prova a salvarlo nuovamente come CSV UTF-8
+                - Controlla che non ci siano caratteri speciali nei dati
+                - Se il file è molto grande, considera di dividerlo
+                """)
+            
+            return None
+    
+    def load_file(self, uploaded_file, file_type: str) -> pd.DataFrame:
+        """Load CSV or XLSX file with automatic chunking for large files"""
+        return self.load_file_chunked(uploaded_file)
+    
+    def validate_columns(self, df: pd.DataFrame, file_type: str, selected_columns: List[str]) -> Tuple[bool, List[str]]:
+        """Validate required columns exist"""
+        required = self.required_columns[file_type]
+        all_required = required + selected_columns
+        missing = [col for col in all_required if col not in df.columns]
+        
+        if missing:
+            return False, missing
+        return True, []
+    
+    def ensure_unique_columns(self, df: pd.DataFrame, operation_name: str = "") -> pd.DataFrame:
+        """Ensure all columns have unique names before operations"""
+        if len(df.columns) != len(set(df.columns)):
+            st.warning(f"⚠️ Colonne duplicate trovate prima di {operation_name}. Correzione in corso...")
+            
+            cols = pd.Series(df.columns)
+            for dup in cols[cols.duplicated()].unique():
+                mask = cols == dup
+                cols[mask] = [f"{dup}_v{i}" if i != 0 else dup for i in range(mask.sum())]
+            
+            df.columns = cols
+            
+            st.info(f"✅ Colonne rese uniche per {operation_name}")
+        
+        return df
+    
+    def preprocess_data_batch(self, df_live: pd.DataFrame, df_staging: pd.DataFrame, 
+                             matching_columns: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Preprocess the data with memory optimization"""
+        st.write("🔄 Preprocessing dei dati...")
+        
+        df_live = df_live.copy()
+        df_staging = df_staging.copy()
+        
+        df_live = self.ensure_unique_columns(df_live, "preprocessing df_live")
+        df_staging = self.ensure_unique_columns(df_staging, "preprocessing df_staging")
+        
+        # Fix Status Code data type - convert to numeric
+        if 'Status Code' in df_live.columns:
+            try:
+                df_live['Status Code'] = pd.to_numeric(df_live['Status Code'], errors='coerce')
+                df_live['Status Code'] = df_live['Status Code'].fillna(200).astype(int)
+                st.info("🔧 Convertita colonna 'Status Code' (PRE) in formato numerico")
+            except Exception as e:
+                st.warning(f"⚠️ Errore conversione Status Code (PRE): {str(e)}")
+                df_live['Status Code'] = 200
+        
+        if 'Status Code' in df_staging.columns:
+            try:
+                df_staging['Status Code'] = pd.to_numeric(df_staging['Status Code'], errors='coerce')
+                df_staging['Status Code'] = df_staging['Status Code'].fillna(200).astype(int)
+                st.info("🔧 Convertita colonna 'Status Code' (POST) in formato numerico")
+            except Exception as e:
+                st.warning(f"⚠️ Errore conversione Status Code (POST): {str(e)}")
+                df_staging['Status Code'] = 200
+        
+        for col in df_live.columns:
+            if col != 'Status Code' and df_live[col].dtype == 'object':
+                df_live[col] = df_live[col].astype('string')
+        
+        for col in df_staging.columns:
+            if col != 'Status Code' and df_staging[col].dtype == 'object':
+                df_staging[col] = df_staging[col].astype('string')
+        
+        for col in matching_columns:
+            if col not in df_live.columns:
+                df_live[col] = ""
+            if col not in df_staging.columns:
+                df_staging[col] = ""
+        
+        if 'Address' not in df_live.columns:
+            st.error("❌ Colonna 'Address' mancante nel file PRE")
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        
+        if 'Address' not in df_staging.columns:
+            st.error("❌ Colonna 'Address' mancante nel file POST")
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        
+        initial_live_count = len(df_live)
+        initial_staging_count = len(df_staging)
+        
+        df_live.drop_duplicates(subset="Address", inplace=True)
+        df_staging.drop_duplicates(subset="Address", inplace=True)
+        
+        st.write(f"📊 Duplicati rimossi: Live {initial_live_count - len(df_live)}, Staging {initial_staging_count - len(df_staging)}")
+        
+        try:
+            df_3xx = df_live[(df_live['Status Code'] >= 300) & (df_live['Status Code'] <= 308)].copy()
+            df_5xx = df_live[(df_live['Status Code'] >= 500) & (df_live['Status Code'] <= 599)].copy()
+            df_non_redirectable = pd.concat([df_3xx, df_5xx]) if not df_3xx.empty or not df_5xx.empty else pd.DataFrame()
+            
+            df_live_200 = df_live[(df_live['Status Code'] >= 200) & (df_live['Status Code'] <= 226)].copy()
+            df_live_400 = df_live[(df_live['Status Code'] >= 400) & (df_live['Status Code'] <= 499)].copy()
+            df_live_clean = pd.concat([df_live_200, df_live_400]) if not df_live_200.empty or not df_live_400.empty else pd.DataFrame()
+            
+            st.write(f"📊 Filtrati per status code: {len(df_live_clean):,} processabili, {len(df_non_redirectable):,} non-redirectable")
+            
+        except Exception as e:
+            st.warning(f"⚠️ Errore nel filtraggio per status code: {str(e)}")
+            st.warning("🔄 Procedendo senza filtri di status code...")
+            df_non_redirectable = pd.DataFrame()
+            df_live_clean = df_live.copy()
+        
+        try:
+            del df_3xx, df_5xx, df_live_200, df_live_400
+        except:
+            pass
+        gc.collect()
+        
+        for col in matching_columns:
+            if col in df_live_clean.columns:
+                df_live_clean[col] = df_live_clean[col].fillna(df_live_clean['Address'])
+            if col in df_staging.columns:
+                df_staging[col] = df_staging[col].fillna(df_staging['Address'])
+        
+        df_live_clean = self.ensure_unique_columns(df_live_clean, "final df_live_clean")
+        df_staging = self.ensure_unique_columns(df_staging, "final df_staging")
+        
+        st.write(f"✅ Preprocessing completato: {len(df_live_clean):,} URL processabili, {len(df_non_redirectable):,} non-redirectable")
+        
+        return df_live_clean, df_staging, df_non_redirectable
+    
+    def perform_polyfuzz_matching_batch(self, df_live: pd.DataFrame, df_staging: pd.DataFrame, 
+                                      matching_columns: List[str]) -> Dict[str, pd.DataFrame]:
+        """Perform PolyFuzz matching in batches for large datasets"""
+        matches = {}
+        
+        total_rows = max(len(df_live), len(df_staging))
+        batch_size = self.calculate_optimal_batch_size(total_rows)
+        
+        st.write(f"🔍 Avvio matching con batch size: {batch_size:,}")
+        st.write(f"💾 Memoria disponibile: {psutil.virtual_memory().available / (1024**3):.1f} GB")
+        
+        main_progress = st.progress(0)
+        status_text = st.empty()
+        
+        total_operations = len(matching_columns)
+        
+        for i, col in enumerate(matching_columns):
+            status_text.text(f"🔍 Matching colonna: {col} ({i+1}/{total_operations})")
+            
+            if len(df_live) > batch_size or len(df_staging) > batch_size:
+                all_matches = []
+                
+                live_batches = [df_live[j:j+batch_size] for j in range(0, len(df_live), batch_size)]
+                staging_data = list(df_staging[col].astype(str))
+                
+                batch_progress = st.progress(0)
+                
+                for batch_idx, live_batch in enumerate(live_batches):
+                    live_data = list(live_batch[col].astype(str))
+                    
+                    model = PolyFuzz("TF-IDF").match(live_data, staging_data)
+                    batch_matches = model.get_matches()
+                    
+                    all_matches.append(batch_matches)
+                    
+                    batch_progress.progress((batch_idx + 1) / len(live_batches))
+                    
+                    del model, live_data
+                    gc.collect()
+                    
+                    if self.get_memory_usage() > self.max_memory_usage:
+                        st.warning("⚠️ Memoria quasi esaurita, consolidando batch...")
+                        break
+                
+                df_match = pd.concat(all_matches, ignore_index=True)
+                del all_matches
+                
+            else:
+                live_data = list(df_live[col].astype(str))
+                staging_data = list(df_staging[col].astype(str))
+                
+                model = PolyFuzz("TF-IDF").match(live_data, staging_data)
+                df_match = model.get_matches()
+                
+                del model, live_data, staging_data
+            
+            similarity_col = f"{col} Similarity"
+            from_col = f"From ({col})"
+            to_col = f"To {col}"
+            
+            df_match.rename(columns={
+                "Similarity": similarity_col,
+                "From": from_col,
+                "To": to_col
+            }, inplace=True)
+            
+            matches[col] = df_match
+            
+            main_progress.progress((i + 1) / total_operations)
+            
+            gc.collect()
+            
+            memory_usage = self.get_memory_usage()
+            if memory_usage > 80:
+                st.warning(f"⚠️ Utilizzo memoria: {memory_usage:.1f}%")
+        
+        status_text.text("✅ Matching completato!")
+        return matches
+    
+    def ai_enhance_matching(self, source_url: str, candidate_urls: List[str], 
+                           source_content: Dict, candidate_contents: List[Dict]) -> Optional[str]:
+        """Use OpenAI to enhance matching when similarity is low"""
+        if not self.openai_client:
+            return None
+        
+        try:
+            prompt = f"""
+            Sei un esperto SEO che deve identificare il miglior match per una URL di migrazione.
+            
+            URL di origine: {source_url}
+            Contenuto origine: {source_content}
+            
+            Candidate URLs e contenuti:
+            """
+            
+            for i, (url, content) in enumerate(zip(candidate_urls, candidate_contents)):
+                prompt += f"\n{i+1}. URL: {url}\n   Contenuto: {content}\n"
+            
+            prompt += """
+            
+            Considera questi fattori:
+            1. Similarità semantica del contenuto
+            2. Struttura dell'URL
+            3. Gerarchia del sito
+            4. Intento della pagina
+            
+            Rispondi SOLO con il numero (1, 2, 3, etc.) della migliore opzione, o 0 se nessuna è appropriata.
+            """
+            
+            response = self.openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=50,
+                temperature=0.1
+            )
+            
+            result = response.choices[0].message.content.strip()
+            
+            match = re.search(r'\d+', result)
+            if match:
+                choice = int(match.group())
+                if 1 <= choice <= len(candidate_urls):
+                    return candidate_urls[choice - 1]
+            
+            return None
+            
+        except Exception as e:
+            st.warning(f"Errore AI enhancement: {str(e)}")
+            return None
+    
+    def merge_matches_batch(self, df_live: pd.DataFrame, df_staging: pd.DataFrame, 
+                           matches: Dict[str, pd.DataFrame], matching_columns: List[str]) -> pd.DataFrame:
+        """Merge all matches into final dataframe with memory optimization"""
+        
+        df_live = self.ensure_unique_columns(df_live, "merge_matches_batch - df_live")
+        df_staging = self.ensure_unique_columns(df_staging, "merge_matches_batch - df_staging")
+        
+        base_columns = ['Address', 'Status Code']
+        available_columns = [col for col in base_columns if col in df_live.columns]
+        available_matching_columns = [col for col in matching_columns if col in df_live.columns]
+        
+        df_final = df_live[available_columns + available_matching_columns].copy()
+        
+        df_final = self.ensure_unique_columns(df_final, "df_final initial")
+        
+        if 'Address' in matches and 'Address' in df_final.columns:
+            try:
+                if df_final.columns.duplicated().any():
+                    df_final = self.ensure_unique_columns(df_final, "before Address merge")
+                
+                df_final = pd.merge(df_final, matches['Address'], 
+                                  left_on="Address", right_on="From (Address)", 
+                                  how="left", suffixes=('', '_url_match'))
+                
+                if "To Address" in df_final.columns:
                     df_final.rename(columns={"To Address": "URL - URL Match"}, inplace=True)
                 
             except ValueError as e:
                 st.error(f"Errore nel merge Address: {str(e)}")
                 st.write("Colonne df_final:", list(df_final.columns))
                 st.write("Colonne matches['Address']:", list(matches['Address'].columns))
-                # Skip Address matching if there's an error
         
-        # Clean any duplicate columns that might have been created
         df_final = self.ensure_unique_columns(df_final, "after Address merge")
         
-        # Merge other columns in batches to manage memory
         for col in matching_columns:
             if col == 'Address':
                 continue
                 
             if col in matches and col in df_staging.columns:
                 try:
-                    # Create mapping dataframe
                     df_col_map = df_staging[[col, 'Address']].drop_duplicates(col)
                     
-                    # Rename Address column to avoid conflicts
                     df_col_map.rename(columns={'Address': f'TargetURL_{col}'}, inplace=True)
                     
-                    # Merge with matches
                     df_match_with_url = pd.merge(
                         matches[col], df_col_map, 
                         left_on=f"To {col}", right_on=col, 
                         how="left"
                     )
                     
-                    # Clean duplicates
                     df_match_with_url = df_match_with_url.drop_duplicates(f"From ({col})")
                     
-                    # Ensure unique columns before merge
                     df_final = self.ensure_unique_columns(df_final, f"before {col} merge")
                     df_match_with_url = self.ensure_unique_columns(df_match_with_url, f"{col} match data")
                     
-                    # Merge with final dataframe
                     df_final = df_final.merge(
                         df_match_with_url, 
                         how='left', left_on=col, right_on=f"From ({col})",
                         suffixes=('', f'_{col.lower().replace(" ", "_").replace("-", "_")}')
                     )
                     
-                    # Rename URL column correctly
                     if f'TargetURL_{col}' in df_final.columns:
                         df_final.rename(columns={f'TargetURL_{col}': f"URL - {col} Match"}, inplace=True)
                     
-                    # Clean duplicate columns after each merge
                     df_final = self.ensure_unique_columns(df_final, f"after {col} merge")
                     
-                    # Memory cleanup
                     del df_col_map, df_match_with_url
                     gc.collect()
                     
@@ -623,662 +1186,4 @@ def main():
         """)
 
 if __name__ == "__main__":
-    main()import streamlit as st
-import pandas as pd
-import numpy as np
-from polyfuzz import PolyFuzz
-import time
-import io
-import gc
-from typing import List, Dict, Tuple, Optional, Union
-import openai
-import json
-import re
-from urllib.parse import urlparse
-import openpyxl
-import psutil
-import os
-import math
-
-# Configure page
-st.set_page_config(
-    page_title="URL Migration Mapping Tool",
-    page_icon="🔗",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-class URLMigrationMapper:
-    def __init__(self):
-        self.df_live = None
-        self.df_staging = None
-        self.openai_client = None
-        self.required_columns = {
-            'pre': ['Address', 'Status Code'],
-            'post': ['Address', 'Status Code', 'Indexability']
-        }
-        self.optional_columns = ['Title 1', 'H1-1']
-        self.batch_size = 5000
-        self.max_memory_usage = 85
-        
-    def get_memory_usage(self) -> float:
-        """Get current memory usage percentage"""
-        return psutil.virtual_memory().percent
-    
-    def calculate_optimal_batch_size(self, total_rows: int, available_memory_gb: float = None) -> int:
-        """Calculate optimal batch size based on data size and available memory"""
-        if available_memory_gb is None:
-            available_memory_gb = psutil.virtual_memory().available / (1024**3)
-        
-        memory_per_row_mb = 0.001
-        max_rows_in_memory = int((available_memory_gb * 1024 * 0.5) / memory_per_row_mb)
-        
-        if total_rows <= max_rows_in_memory:
-            return total_rows
-        
-        num_batches = math.ceil(total_rows / max_rows_in_memory)
-        optimal_batch_size = math.ceil(total_rows / num_batches)
-        optimal_batch_size = max(1000, min(optimal_batch_size, 10000))
-        
-        return optimal_batch_size
-    
-    def setup_openai(self, api_key: str) -> bool:
-        """Setup OpenAI client"""
-        try:
-            self.openai_client = openai.OpenAI(api_key=api_key)
-            self.openai_client.models.list()
-            return True
-        except Exception as e:
-            st.error(f"Errore nella configurazione OpenAI: {str(e)}")
-            return False
-    
-    def load_file_chunked(self, uploaded_file, chunk_size: int = 10000) -> pd.DataFrame:
-        """Load large files in chunks to avoid memory issues"""
-        try:
-            file_size_mb = uploaded_file.size / (1024 * 1024)
-            st.info(f"📁 Caricamento file: {uploaded_file.name} ({file_size_mb:.1f} MB)")
-            
-            if uploaded_file.name.endswith('.csv'):
-                # Enhanced CSV parameters for problematic files
-                csv_params = {
-                    'on_bad_lines': 'skip',  # Skip bad lines instead of warning (faster)
-                    'sep': ',',
-                    'quotechar': '"',
-                    'skipinitialspace': True,
-                    'low_memory': False,
-                    'encoding': 'utf-8',
-                    'engine': 'python',     # More flexible parser
-                    'error_bad_lines': False  # Don't raise errors on bad lines
-                }
-                
-                # Try different encodings
-                encodings_to_try = ['utf-8', 'latin-1', 'cp1252']
-                
-                if file_size_mb > 100:  # Large file handling
-                    st.info("📊 File grande rilevato - utilizzo caricamento ottimizzato con gestione errori")
-                    
-                    chunks = []
-                    df_loaded = False
-                    skipped_lines = 0
-                    
-                    for encoding in encodings_to_try:
-                        try:
-                            csv_params['encoding'] = encoding
-                            
-                            # Reset file pointer
-                            uploaded_file.seek(0)
-                            
-                            # Use smaller chunks for problematic files
-                            safe_chunk_size = min(chunk_size, 5000) if file_size_mb > 500 else chunk_size
-                            
-                            chunk_iterator = pd.read_csv(uploaded_file, 
-                                                       chunksize=safe_chunk_size, 
-                                                       **csv_params)
-                            
-                            total_chunks = math.ceil(file_size_mb / 5)  # More conservative estimate
-                            progress_bar = st.progress(0)
-                            status_text = st.empty()
-                            
-                            chunk_count = 0
-                            for i, chunk in enumerate(chunk_iterator):
-                                # Memory check before processing each chunk
-                                current_memory = self.get_memory_usage()
-                                if current_memory > self.max_memory_usage:
-                                    st.warning(f"⚠️ Memoria alta ({current_memory:.1f}%), consolidando chunks...")
-                                    if chunks:  # Only break if we have some data
-                                        break
-                                
-                                # Clean the chunk
-                                if not chunk.empty:
-                                    # Remove completely empty rows
-                                    chunk = chunk.dropna(how='all')
-                                    
-                                    if not chunk.empty:
-                                        chunks.append(chunk)
-                                        chunk_count += 1
-                                
-                                # Update progress
-                                progress = min((i + 1) / total_chunks, 1.0)
-                                progress_bar.progress(progress)
-                                status_text.text(f"📦 Processati {chunk_count} chunks, memoria: {current_memory:.1f}%")
-                                
-                                # Periodic garbage collection for large files
-                                if i % 10 == 0:
-                                    gc.collect()
-                            
-                            if chunks:
-                                status_text.text("🔗 Combinando chunks...")
-                                df = pd.concat(chunks, ignore_index=True, sort=False)
-                                del chunks
-                                gc.collect()
-                                df_loaded = True
-                                st.success(f"✅ File caricato con encoding: {encoding} ({chunk_count} chunks)")
-                                break
-                            else:
-                                st.warning(f"⚠️ Nessun dato valido trovato con encoding {encoding}")
-                                continue
-                            
-                        except Exception as e:
-                            if chunks:
-                                del chunks
-                                chunks = []
-                            st.warning(f"⚠️ Errore con encoding {encoding}: {str(e)[:100]}...")
-                            continue
-                    
-                    if not df_loaded:
-                        raise ValueError("Impossibile caricare il file. Troppi errori nei dati.")
-                        
-                else:  # Smaller files
-                    df_loaded = False
-                    
-                    for encoding in encodings_to_try:
-                        try:
-                            csv_params['encoding'] = encoding
-                            uploaded_file.seek(0)
-                            df = pd.read_csv(uploaded_file, **csv_params)
-                            df_loaded = True
-                            st.success(f"✅ File caricato con encoding: {encoding}")
-                            break
-                            
-                        except Exception as e:
-                            st.warning(f"⚠️ Errore con encoding {encoding}: {str(e)[:100]}...")
-                            continue
-                    
-                    if not df_loaded:
-                        raise ValueError("Impossibile caricare il file con nessuno degli encoding testati")
-                    
-            elif uploaded_file.name.endswith(('.xlsx', '.xls')):
-                # Excel files with better error handling
-                if file_size_mb > 50:
-                    st.warning("⚠️ File Excel grande rilevato. Il caricamento potrebbe richiedere tempo...")
-                
-                try:
-                    df = pd.read_excel(uploaded_file, engine='openpyxl')
-                except Exception as e:
-                    st.warning(f"⚠️ Tentativo con openpyxl fallito: {str(e)}")
-                    try:
-                        df = pd.read_excel(uploaded_file, engine='xlrd')
-                    except Exception as e2:
-                        raise ValueError(f"Impossibile caricare il file Excel: {str(e2)}")
-            else:
-                raise ValueError("Formato file non supportato")
-            
-            # Enhanced post-processing
-            st.info(f"🔍 Ottimizzazione file caricato...")
-            
-            original_rows = len(df)
-            original_columns = len(df.columns)
-            
-            # Remove completely empty rows
-            df = df.dropna(how='all')
-            empty_rows_removed = original_rows - len(df)
-            
-            if empty_rows_removed > 0:
-                st.info(f"🗑️ Rimosse {empty_rows_removed} righe completamente vuote")
-            
-            # Remove completely empty columns
-            empty_cols = df.columns[df.isnull().all()].tolist()
-            if empty_cols:
-                df.drop(columns=empty_cols, inplace=True)
-                st.info(f"🗑️ Rimosse {len(empty_cols)} colonne completamente vuote")
-            
-            # Handle unnamed columns more intelligently
-            unnamed_cols = [col for col in df.columns if str(col).startswith('Unnamed:')]
-            if unnamed_cols:
-                cols_to_remove = []
-                for col in unnamed_cols:
-                    non_null_pct = df[col].notna().sum() / len(df)
-                    if non_null_pct < 0.05:  # Less than 5% non-null
-                        cols_to_remove.append(col)
-                
-                if cols_to_remove:
-                    df.drop(columns=cols_to_remove, inplace=True)
-                    st.info(f"🗑️ Rimosse {len(cols_to_remove)} colonne 'Unnamed' quasi vuote")
-            
-            # Clean column names
-            df.columns = df.columns.astype(str)
-            df.columns = [col.strip().replace('\n', ' ').replace('\r', ' ') for col in df.columns]
-            
-            # Memory optimization for large files
-            if len(df) > 50000:
-                st.info("🔧 Ottimizzazione tipi di dati per file grande...")
-                
-                # Optimize string columns
-                for col in df.columns:
-                    if df[col].dtype == 'object':
-                        # Try to convert to category if many repeated values
-                        unique_ratio = df[col].nunique() / len(df)
-                        if unique_ratio < 0.5:  # Less than 50% unique values
-                            try:
-                                df[col] = df[col].astype('category')
-                            except:
-                                df[col] = df[col].astype('string')
-                        else:
-                            df[col] = df[col].astype('string')
-                
-                gc.collect()
-            
-            # Final stats
-            final_rows = len(df)
-            final_columns = len(df.columns)
-            
-            st.success(f"✅ File ottimizzato: {final_rows:,} righe, {final_columns} colonne")
-            
-            if final_rows != original_rows or final_columns != original_columns:
-                st.info(f"📊 Ottimizzazioni: {original_rows:,}→{final_rows:,} righe, {original_columns}→{final_columns} colonne")
-            
-            # Show column preview
-            if len(df.columns) > 15:
-                st.info(f"🔍 Prime 15 colonne: {list(df.columns[:15])}")
-                st.info(f"📝 + altre {len(df.columns) - 15} colonne...")
-            else:
-                st.info(f"🔍 Colonne: {list(df.columns)}")
-            
-            # Memory usage info
-            memory_usage = df.memory_usage(deep=True).sum() / 1024 / 1024  # MB
-            st.info(f"💾 Utilizzo memoria DataFrame: {memory_usage:.1f} MB")
-            
-            return df
-            
-        except Exception as e:
-            error_msg = str(e)
-            st.error(f"❌ Errore nel caricamento del file {uploaded_file.name}")
-            st.error(f"Dettaglio errore: {error_msg}")
-            
-            # Provide specific suggestions based on error type
-            if "expected" in error_msg and "saw" in error_msg:
-                st.markdown("""
-                **🔧 Problema rilevato: Colonne inconsistenti**
-                
-                **Soluzioni consigliate:**
-                1. **Apri il file in Excel** e verifica che tutte le righe abbiano lo stesso numero di colonne
-                2. **Cerca righe con virgole extra** nei contenuti (es. descrizioni, title)
-                3. **Salva come CSV UTF-8** da Excel per pulire il formato
-                4. **Rimuovi manualmente** le righe problematiche (vedi numeri sopra)
-                """)
-            elif "encoding" in error_msg.lower():
-                st.markdown("""
-                **🔧 Problema rilevato: Encoding del file**
-                
-                **Soluzioni:**
-                - Salva il file come **CSV UTF-8** da Excel
-                - Prova a convertire con un editor di testo (Notepad++, VS Code)
-                """)
-            elif "memory" in error_msg.lower():
-                st.markdown("""
-                **🔧 Problema rilevato: Memoria insufficiente**
-                
-                **Soluzioni:**
-                - Dividi il file in parti più piccole
-                - Rimuovi colonne non necessarie prima del caricamento
-                - Chiudi altre applicazioni per liberare memoria
-                """)
-            else:
-                st.markdown("""
-                **💡 Suggerimenti generali:**
-                - Verifica che il file non sia corrotto
-                - Prova a salvarlo nuovamente come CSV UTF-8
-                - Controlla che non ci siano caratteri speciali nei dati
-                - Se il file è molto grande, considera di dividerlo
-                """)
-            
-            return None
-    
-    def load_file(self, uploaded_file, file_type: str) -> pd.DataFrame:
-        """Load CSV or XLSX file with automatic chunking for large files"""
-        return self.load_file_chunked(uploaded_file)
-    
-    def validate_columns(self, df: pd.DataFrame, file_type: str, selected_columns: List[str]) -> Tuple[bool, List[str]]:
-        """Validate required columns exist"""
-        required = self.required_columns[file_type]
-        all_required = required + selected_columns
-        missing = [col for col in all_required if col not in df.columns]
-        
-        if missing:
-            return False, missing
-        return True, []
-    
-    def clean_duplicate_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Remove duplicate column names and handle conflicts"""
-        if len(df.columns) != len(set(df.columns)):
-            st.warning("⚠️ Colonne duplicate rilevate, pulizia in corso...")
-            
-            # Create a mapping of old to new column names
-            new_columns = []
-            seen_columns = {}
-            
-            for col in df.columns:
-                if col in seen_columns:
-                    seen_columns[col] += 1
-                    new_col = f"{col}_duplicate_{seen_columns[col]}"
-                else:
-                    seen_columns[col] = 0
-                    new_col = col
-                new_columns.append(new_col)
-            
-            # Assign new column names
-            df.columns = new_columns
-            
-            # Remove obviously duplicate Address columns (keep only the main one)
-            duplicate_address_cols = [col for col in df.columns if col.startswith('Address_duplicate_')]
-            if duplicate_address_cols:
-                df.drop(columns=duplicate_address_cols, inplace=True, errors='ignore')
-                st.info(f"🗑️ Rimosse colonne duplicate: {duplicate_address_cols}")
-            
-            st.info(f"✅ Colonne pulite: {len(df.columns)} colonne rimanenti")
-        
-        return df
-
-    def ensure_unique_columns(self, df: pd.DataFrame, operation_name: str = "") -> pd.DataFrame:
-        """Ensure all columns have unique names before operations"""
-        if len(df.columns) != len(set(df.columns)):
-            st.warning(f"⚠️ Colonne duplicate trovate prima di {operation_name}. Correzione in corso...")
-            
-            # Make columns unique by adding suffix
-            cols = pd.Series(df.columns)
-            for dup in cols[cols.duplicated()].unique():
-                mask = cols == dup
-                cols[mask] = [f"{dup}_v{i}" if i != 0 else dup for i in range(mask.sum())]
-            
-            df.columns = cols
-            
-            st.info(f"✅ Colonne rese uniche per {operation_name}")
-        
-        return df
-    
-    def preprocess_data_batch(self, df_live: pd.DataFrame, df_staging: pd.DataFrame, 
-                             matching_columns: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """Preprocess the data with memory optimization"""
-        st.write("🔄 Preprocessing dei dati...")
-        
-        df_live = df_live.copy()
-        df_staging = df_staging.copy()
-        
-        # Clean duplicate columns FIRST - this is critical
-        df_live = self.ensure_unique_columns(df_live, "preprocessing df_live")
-        df_staging = self.ensure_unique_columns(df_staging, "preprocessing df_staging")
-        
-        # Fix Status Code data type - convert to numeric
-        if 'Status Code' in df_live.columns:
-            try:
-                # Convert to numeric, replacing non-numeric values with NaN
-                df_live['Status Code'] = pd.to_numeric(df_live['Status Code'], errors='coerce')
-                # Fill NaN values with 200 (default OK status)
-                df_live['Status Code'] = df_live['Status Code'].fillna(200).astype(int)
-                st.info("🔧 Convertita colonna 'Status Code' (PRE) in formato numerico")
-            except Exception as e:
-                st.warning(f"⚠️ Errore conversione Status Code (PRE): {str(e)}")
-                # If conversion fails, create a default column
-                df_live['Status Code'] = 200
-        
-        if 'Status Code' in df_staging.columns:
-            try:
-                # Convert to numeric, replacing non-numeric values with NaN  
-                df_staging['Status Code'] = pd.to_numeric(df_staging['Status Code'], errors='coerce')
-                # Fill NaN values with 200 (default OK status)
-                df_staging['Status Code'] = df_staging['Status Code'].fillna(200).astype(int)
-                st.info("🔧 Convertita colonna 'Status Code' (POST) in formato numerico")
-            except Exception as e:
-                st.warning(f"⚠️ Errore conversione Status Code (POST): {str(e)}")
-                # If conversion fails, create a default column
-                df_staging['Status Code'] = 200
-        
-        # Optimize data types to save memory
-        for col in df_live.columns:
-            if col != 'Status Code' and df_live[col].dtype == 'object':
-                df_live[col] = df_live[col].astype('string')
-        
-        for col in df_staging.columns:
-            if col != 'Status Code' and df_staging[col].dtype == 'object':
-                df_staging[col] = df_staging[col].astype('string')
-        
-        # Ensure required columns exist
-        for col in matching_columns:
-            if col not in df_live.columns:
-                df_live[col] = ""
-            if col not in df_staging.columns:
-                df_staging[col] = ""
-        
-        # Verify Address column exists and is unique
-        if 'Address' not in df_live.columns:
-            st.error("❌ Colonna 'Address' mancante nel file PRE")
-            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-        
-        if 'Address' not in df_staging.columns:
-            st.error("❌ Colonna 'Address' mancante nel file POST")
-            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-        
-        # Drop duplicates with progress tracking
-        initial_live_count = len(df_live)
-        initial_staging_count = len(df_staging)
-        
-        df_live.drop_duplicates(subset="Address", inplace=True)
-        df_staging.drop_duplicates(subset="Address", inplace=True)
-        
-        st.write(f"📊 Duplicati rimossi: Live {initial_live_count - len(df_live)}, Staging {initial_staging_count - len(df_staging)}")
-        
-        # Extract non-redirectable URLs (3xx & 5xx) with safe numeric comparison
-        try:
-            df_3xx = df_live[(df_live['Status Code'] >= 300) & (df_live['Status Code'] <= 308)].copy()
-            df_5xx = df_live[(df_live['Status Code'] >= 500) & (df_live['Status Code'] <= 599)].copy()
-            df_non_redirectable = pd.concat([df_3xx, df_5xx]) if not df_3xx.empty or not df_5xx.empty else pd.DataFrame()
-            
-            # Keep 2xx and 4xx status codes for redirecting
-            df_live_200 = df_live[(df_live['Status Code'] >= 200) & (df_live['Status Code'] <= 226)].copy()
-            df_live_400 = df_live[(df_live['Status Code'] >= 400) & (df_live['Status Code'] <= 499)].copy()
-            df_live_clean = pd.concat([df_live_200, df_live_400]) if not df_live_200.empty or not df_live_400.empty else pd.DataFrame()
-            
-            st.write(f"📊 Filtrati per status code: {len(df_live_clean):,} processabili, {len(df_non_redirectable):,} non-redirectable")
-            
-        except Exception as e:
-            st.warning(f"⚠️ Errore nel filtraggio per status code: {str(e)}")
-            st.warning("🔄 Procedendo senza filtri di status code...")
-            # If status code filtering fails, use all data
-            df_non_redirectable = pd.DataFrame()
-            df_live_clean = df_live.copy()
-        
-        # Clean up intermediate dataframes
-        try:
-            del df_3xx, df_5xx, df_live_200, df_live_400
-        except:
-            pass
-        gc.collect()
-        
-        # Handle NaN values - populate with URL for 404s
-        for col in matching_columns:
-            if col in df_live_clean.columns:
-                df_live_clean[col] = df_live_clean[col].fillna(df_live_clean['Address'])
-            if col in df_staging.columns:
-                df_staging[col] = df_staging[col].fillna(df_staging['Address'])
-        
-        # Final check for unique columns
-        df_live_clean = self.ensure_unique_columns(df_live_clean, "final df_live_clean")
-        df_staging = self.ensure_unique_columns(df_staging, "final df_staging")
-        
-        st.write(f"✅ Preprocessing completato: {len(df_live_clean):,} URL processabili, {len(df_non_redirectable):,} non-redirectable")
-        
-        return df_live_clean, df_staging, df_non_redirectable
-    
-    def perform_polyfuzz_matching_batch(self, df_live: pd.DataFrame, df_staging: pd.DataFrame, 
-                                      matching_columns: List[str]) -> Dict[str, pd.DataFrame]:
-        """Perform PolyFuzz matching in batches for large datasets"""
-        matches = {}
-        
-        total_rows = max(len(df_live), len(df_staging))
-        batch_size = self.calculate_optimal_batch_size(total_rows)
-        
-        st.write(f"🔍 Avvio matching con batch size: {batch_size:,}")
-        st.write(f"💾 Memoria disponibile: {psutil.virtual_memory().available / (1024**3):.1f} GB")
-        
-        main_progress = st.progress(0)
-        status_text = st.empty()
-        
-        total_operations = len(matching_columns)
-        
-        for i, col in enumerate(matching_columns):
-            status_text.text(f"🔍 Matching colonna: {col} ({i+1}/{total_operations})")
-            
-            if len(df_live) > batch_size or len(df_staging) > batch_size:
-                all_matches = []
-                
-                live_batches = [df_live[j:j+batch_size] for j in range(0, len(df_live), batch_size)]
-                staging_data = list(df_staging[col].astype(str))
-                
-                batch_progress = st.progress(0)
-                
-                for batch_idx, live_batch in enumerate(live_batches):
-                    live_data = list(live_batch[col].astype(str))
-                    
-                    model = PolyFuzz("TF-IDF").match(live_data, staging_data)
-                    batch_matches = model.get_matches()
-                    
-                    all_matches.append(batch_matches)
-                    
-                    batch_progress.progress((batch_idx + 1) / len(live_batches))
-                    
-                    del model, live_data
-                    gc.collect()
-                    
-                    if self.get_memory_usage() > self.max_memory_usage:
-                        st.warning("⚠️ Memoria quasi esaurita, consolidando batch...")
-                        break
-                
-                df_match = pd.concat(all_matches, ignore_index=True)
-                del all_matches
-                
-            else:
-                live_data = list(df_live[col].astype(str))
-                staging_data = list(df_staging[col].astype(str))
-                
-                model = PolyFuzz("TF-IDF").match(live_data, staging_data)
-                df_match = model.get_matches()
-                
-                del model, live_data, staging_data
-            
-            similarity_col = f"{col} Similarity"
-            from_col = f"From ({col})"
-            to_col = f"To {col}"
-            
-            df_match.rename(columns={
-                "Similarity": similarity_col,
-                "From": from_col,
-                "To": to_col
-            }, inplace=True)
-            
-            matches[col] = df_match
-            
-            main_progress.progress((i + 1) / total_operations)
-            
-            gc.collect()
-            
-            memory_usage = self.get_memory_usage()
-            if memory_usage > 80:
-                st.warning(f"⚠️ Utilizzo memoria: {memory_usage:.1f}%")
-        
-        status_text.text("✅ Matching completato!")
-        return matches
-    
-    def ai_enhance_matching(self, source_url: str, candidate_urls: List[str], 
-                           source_content: Dict, candidate_contents: List[Dict]) -> Optional[str]:
-        """Use OpenAI to enhance matching when similarity is low"""
-        if not self.openai_client:
-            return None
-        
-        try:
-            prompt = f"""
-            Sei un esperto SEO che deve identificare il miglior match per una URL di migrazione.
-            
-            URL di origine: {source_url}
-            Contenuto origine: {source_content}
-            
-            Candidate URLs e contenuti:
-            """
-            
-            for i, (url, content) in enumerate(zip(candidate_urls, candidate_contents)):
-                prompt += f"\n{i+1}. URL: {url}\n   Contenuto: {content}\n"
-            
-            prompt += """
-            
-            Considera questi fattori:
-            1. Similarità semantica del contenuto
-            2. Struttura dell'URL
-            3. Gerarchia del sito
-            4. Intento della pagina
-            
-            Rispondi SOLO con il numero (1, 2, 3, etc.) della migliore opzione, o 0 se nessuna è appropriata.
-            """
-            
-            response = self.openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=50,
-                temperature=0.1
-            )
-            
-            result = response.choices[0].message.content.strip()
-            
-            match = re.search(r'\d+', result)
-            if match:
-                choice = int(match.group())
-                if 1 <= choice <= len(candidate_urls):
-                    return candidate_urls[choice - 1]
-            
-            return None
-            
-        except Exception as e:
-            st.warning(f"Errore AI enhancement: {str(e)}")
-            return None
-    
-    def merge_matches_batch(self, df_live: pd.DataFrame, df_staging: pd.DataFrame, 
-                           matches: Dict[str, pd.DataFrame], matching_columns: List[str]) -> pd.DataFrame:
-        """Merge all matches into final dataframe with memory optimization"""
-        
-        # Ensure unique columns before starting
-        df_live = self.ensure_unique_columns(df_live, "merge_matches_batch - df_live")
-        df_staging = self.ensure_unique_columns(df_staging, "merge_matches_batch - df_staging")
-        
-        # Start with a base dataframe - only select columns that exist
-        base_columns = ['Address', 'Status Code']
-        available_columns = [col for col in base_columns if col in df_live.columns]
-        available_matching_columns = [col for col in matching_columns if col in df_live.columns]
-        
-        df_final = df_live[available_columns + available_matching_columns].copy()
-        
-        # Ensure df_final has unique columns
-        df_final = self.ensure_unique_columns(df_final, "df_final initial")
-        
-        # Add Address matching if available
-        if 'Address' in matches and 'Address' in df_final.columns:
-            try:
-                # Double check that Address column is unique in df_final
-                if df_final.columns.duplicated().any():
-                    df_final = self.ensure_unique_columns(df_final, "before Address merge")
-                
-                # Perform the merge with explicit error handling
-                df_final = pd.merge(df_final, matches['Address'], 
-                                  left_on="Address", right_on="From (Address)", 
-                                  how="left", suffixes=('', '_url_match'))
-                
-                # Rename the URL column
-                if "To Address" in df_final.columns:
-                    df_final.rename(columns={"To Address": "
+    main()
