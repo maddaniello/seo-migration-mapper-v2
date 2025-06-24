@@ -74,40 +74,153 @@ class URLMigrationMapper:
             st.info(f"📁 Caricamento file: {uploaded_file.name} ({file_size_mb:.1f} MB)")
             
             if uploaded_file.name.endswith('.csv'):
-                if file_size_mb > 100:
+                # For CSV files with flexible column handling
+                csv_params = {
+                    'on_bad_lines': 'warn',  # Handle bad lines gracefully
+                    'sep': ',',              # Default separator
+                    'quotechar': '"',        # Handle quoted fields
+                    'skipinitialspace': True, # Skip spaces after delimiter
+                    'low_memory': False,     # Read entire file for consistency
+                    'encoding': 'utf-8'      # Default encoding
+                }
+                
+                # Try different encodings if UTF-8 fails
+                encodings_to_try = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+                
+                if file_size_mb > 100:  # Large file handling
+                    st.info("📊 File grande rilevato - utilizzo caricamento chunk ottimizzato")
+                    
                     chunks = []
-                    chunk_iterator = pd.read_csv(uploaded_file, chunksize=chunk_size)
+                    df_loaded = False
                     
-                    total_chunks = math.ceil(file_size_mb / 10)
-                    progress_bar = st.progress(0)
-                    
-                    for i, chunk in enumerate(chunk_iterator):
-                        chunks.append(chunk)
-                        progress_bar.progress(min((i + 1) / total_chunks, 1.0))
-                        
-                        if self.get_memory_usage() > self.max_memory_usage:
-                            st.warning("⚠️ Utilizzo memoria alto, consolidando chunks...")
+                    for encoding in encodings_to_try:
+                        try:
+                            csv_params['encoding'] = encoding
+                            chunk_iterator = pd.read_csv(uploaded_file, 
+                                                       chunksize=chunk_size, 
+                                                       **csv_params)
+                            
+                            total_chunks = math.ceil(file_size_mb / 10)
+                            progress_bar = st.progress(0)
+                            
+                            for i, chunk in enumerate(chunk_iterator):
+                                chunks.append(chunk)
+                                progress_bar.progress(min((i + 1) / total_chunks, 1.0))
+                                
+                                if self.get_memory_usage() > self.max_memory_usage:
+                                    st.warning("⚠️ Utilizzo memoria alto, consolidando chunks...")
+                                    break
+                            
+                            df = pd.concat(chunks, ignore_index=True, sort=False)
+                            del chunks
+                            gc.collect()
+                            df_loaded = True
+                            st.success(f"✅ File caricato con encoding: {encoding}")
                             break
+                            
+                        except (UnicodeDecodeError, pd.errors.EmptyDataError, pd.errors.ParserError) as e:
+                            if chunks:
+                                del chunks
+                                chunks = []
+                            st.warning(f"⚠️ Tentativo con encoding {encoding} fallito: {str(e)}")
+                            continue
                     
-                    df = pd.concat(chunks, ignore_index=True)
-                    del chunks
-                    gc.collect()
-                else:
-                    df = pd.read_csv(uploaded_file)
+                    if not df_loaded:
+                        raise ValueError("Impossibile caricare il file con nessuno degli encoding testati")
+                        
+                else:  # Smaller files
+                    df_loaded = False
+                    
+                    for encoding in encodings_to_try:
+                        try:
+                            csv_params['encoding'] = encoding
+                            df = pd.read_csv(uploaded_file, **csv_params)
+                            df_loaded = True
+                            st.success(f"✅ File caricato con encoding: {encoding}")
+                            break
+                            
+                        except (UnicodeDecodeError, pd.errors.EmptyDataError, pd.errors.ParserError) as e:
+                            st.warning(f"⚠️ Tentativo con encoding {encoding} fallito: {str(e)}")
+                            continue
+                    
+                    if not df_loaded:
+                        raise ValueError("Impossibile caricare il file con nessuno degli encoding testati")
                     
             elif uploaded_file.name.endswith(('.xlsx', '.xls')):
+                # Excel files
                 if file_size_mb > 50:
                     st.warning("⚠️ File Excel grande rilevato. Il caricamento potrebbe richiedere tempo...")
                 
-                df = pd.read_excel(uploaded_file)
+                # Excel files are generally more consistent, but we can still handle errors
+                try:
+                    df = pd.read_excel(uploaded_file, engine='openpyxl')
+                except Exception as e:
+                    st.warning(f"⚠️ Tentativo con openpyxl fallito: {str(e)}")
+                    try:
+                        df = pd.read_excel(uploaded_file, engine='xlrd')
+                    except Exception as e2:
+                        raise ValueError(f"Impossibile caricare il file Excel: {str(e2)}")
             else:
                 raise ValueError("Formato file non supportato")
             
+            # Post-processing cleanup
+            st.info(f"🔍 Analisi file caricato...")
+            
+            # Handle inconsistent columns
+            original_columns = len(df.columns)
+            
+            # Remove completely empty columns
+            empty_cols = df.columns[df.isnull().all()].tolist()
+            if empty_cols:
+                df.drop(columns=empty_cols, inplace=True)
+                st.info(f"🗑️ Rimosse {len(empty_cols)} colonne completamente vuote")
+            
+            # Remove columns with no name (often caused by parsing issues)
+            unnamed_cols = [col for col in df.columns if str(col).startswith('Unnamed:')]
+            if unnamed_cols:
+                # Only remove if they're mostly empty
+                cols_to_remove = []
+                for col in unnamed_cols:
+                    if df[col].notna().sum() / len(df) < 0.01:  # Less than 1% non-null
+                        cols_to_remove.append(col)
+                
+                if cols_to_remove:
+                    df.drop(columns=cols_to_remove, inplace=True)
+                    st.info(f"🗑️ Rimosse {len(cols_to_remove)} colonne 'Unnamed' vuote")
+            
+            # Clean column names
+            df.columns = df.columns.astype(str)
+            df.columns = [col.strip() for col in df.columns]  # Remove whitespace
+            
+            # Report final stats
+            final_columns = len(df.columns)
+            if final_columns != original_columns:
+                st.info(f"📊 Colonne ottimizzate: {original_columns} → {final_columns}")
+            
             st.success(f"✅ File caricato: {len(df):,} righe, {len(df.columns)} colonne")
+            
+            # Show a sample of columns for verification
+            if len(df.columns) > 10:
+                st.info(f"🔍 Prime 10 colonne: {list(df.columns[:10])}")
+            else:
+                st.info(f"🔍 Colonne trovate: {list(df.columns)}")
+            
             return df
             
         except Exception as e:
             st.error(f"Errore nel caricamento del file {uploaded_file.name}: {str(e)}")
+            
+            # Provide helpful suggestions
+            st.markdown("""
+            **💡 Suggerimenti per risolvere problemi di caricamento:**
+            
+            - **File CSV corrotto**: Apri in Excel e salva di nuovo come CSV UTF-8
+            - **Caratteri speciali**: Verifica encoding del file (UTF-8 raccomandato)
+            - **Colonne inconsistenti**: Verifica che tutte le righe abbiano lo stesso numero di colonne
+            - **File troppo grande**: Prova a dividere il file in parti più piccole
+            - **Formato non supportato**: Converti in CSV o Excel (.xlsx)
+            """)
+            
             return None
     
     def load_file(self, uploaded_file, file_type: str) -> pd.DataFrame:
