@@ -1,5 +1,4 @@
-# Rename the URL column
-                if "To Address" in df_final.columns:
+if "To Address" in df_final.columns:
                     df_final.rename(columns={"To Address": "URL - URL Match"}, inplace=True)
                 
             except ValueError as e:
