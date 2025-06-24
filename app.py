@@ -142,6 +142,10 @@ class URLMigrationMapper:
         df_live = df_live.copy()
         df_staging = df_staging.copy()
         
+        # Clean duplicate columns if they exist
+        df_live = self.clean_duplicate_columns(df_live)
+        df_staging = self.clean_duplicate_columns(df_staging)
+        
         # Optimize data types to save memory
         for col in df_live.columns:
             if df_live[col].dtype == 'object':
@@ -170,12 +174,12 @@ class URLMigrationMapper:
         # Extract non-redirectable URLs (3xx & 5xx)
         df_3xx = df_live[(df_live['Status Code'] >= 300) & (df_live['Status Code'] <= 308)].copy()
         df_5xx = df_live[(df_live['Status Code'] >= 500) & (df_live['Status Code'] <= 599)].copy()
-        df_non_redirectable = pd.concat([df_3xx, df_5xx])
+        df_non_redirectable = pd.concat([df_3xx, df_5xx]) if not df_3xx.empty or not df_5xx.empty else pd.DataFrame()
         
         # Keep 2xx and 4xx status codes for redirecting
         df_live_200 = df_live[(df_live['Status Code'] >= 200) & (df_live['Status Code'] <= 226)].copy()
         df_live_400 = df_live[(df_live['Status Code'] >= 400) & (df_live['Status Code'] <= 499)].copy()
-        df_live_clean = pd.concat([df_live_200, df_live_400])
+        df_live_clean = pd.concat([df_live_200, df_live_400]) if not df_live_200.empty or not df_live_400.empty else pd.DataFrame()
         
         # Clean up intermediate dataframes
         del df_3xx, df_5xx, df_live_200, df_live_400
@@ -183,8 +187,10 @@ class URLMigrationMapper:
         
         # Handle NaN values - populate with URL for 404s
         for col in matching_columns:
-            df_live_clean[col] = df_live_clean[col].fillna(df_live_clean['Address'])
-            df_staging[col] = df_staging[col].fillna(df_staging['Address'])
+            if col in df_live_clean.columns:
+                df_live_clean[col] = df_live_clean[col].fillna(df_live_clean['Address'])
+            if col in df_staging.columns:
+                df_staging[col] = df_staging[col].fillna(df_staging['Address'])
         
         st.write(f"✅ Preprocessing completato: {len(df_live_clean):,} URL processabili, {len(df_non_redirectable):,} non-redirectable")
         
@@ -335,7 +341,35 @@ class URLMigrationMapper:
             st.warning(f"Errore AI enhancement: {str(e)}")
             return None
     
-    def merge_matches_batch(self, df_live: pd.DataFrame, df_staging: pd.DataFrame, 
+    def clean_duplicate_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Remove duplicate column names and handle conflicts"""
+        if len(df.columns) != len(set(df.columns)):
+            st.warning("⚠️ Colonne duplicate rilevate, pulizia in corso...")
+            
+            # Create new column names
+            new_columns = []
+            seen_columns = {}
+            
+            for col in df.columns:
+                if col in seen_columns:
+                    seen_columns[col] += 1
+                    new_col = f"{col}_{seen_columns[col]}"
+                else:
+                    seen_columns[col] = 0
+                    new_col = col
+                new_columns.append(new_col)
+            
+            df.columns = new_columns
+            
+            # Remove obviously duplicate Address columns (keep only the main one)
+            address_variants = [col for col in df.columns if 'Address' in col and col != 'Address']
+            for col in address_variants:
+                if col.endswith('_1') or col.endswith('_2') or col.endswith('_3'):
+                    df.drop(columns=[col], inplace=True, errors='ignore')
+            
+            st.info(f"✅ Colonne pulite: {len(df.columns)} colonne rimanenti")
+        
+        return df 
                            matches: Dict[str, pd.DataFrame], matching_columns: List[str]) -> pd.DataFrame:
         """Merge all matches into final dataframe with memory optimization"""
         
@@ -346,7 +380,7 @@ class URLMigrationMapper:
         if 'Address' in matches:
             df_final = pd.merge(df_final, matches['Address'], 
                               left_on="Address", right_on="From (Address)", 
-                              how="left", suffixes=('', '_addr'))
+                              how="left", suffixes=('', '_url_match'))
             df_final.rename(columns={"To Address": "URL - URL Match"}, inplace=True)
         
         # Merge other columns in batches to manage memory
@@ -357,6 +391,7 @@ class URLMigrationMapper:
             if col in matches:
                 # Create mapping dataframe
                 df_col_map = df_staging[[col, 'Address']].drop_duplicates(col)
+                df_col_map.rename(columns={'Address': f'Address_{col}'}, inplace=True)
                 
                 # Merge with matches
                 df_match_with_url = pd.merge(
@@ -365,26 +400,29 @@ class URLMigrationMapper:
                     how="left"
                 )
                 
+                # Clean column names before merge
+                df_match_with_url = df_match_with_url.drop_duplicates(f"From ({col})")
+                
                 # Merge with final dataframe
                 df_final = df_final.merge(
-                    df_match_with_url.drop_duplicates(f"From ({col})"), 
+                    df_match_with_url, 
                     how='left', left_on=col, right_on=f"From ({col})",
-                    suffixes=('', f'_{col.lower()}')
+                    suffixes=('', f'_{col.lower().replace(" ", "_")}')
                 )
                 
-                # Rename URL column
-                if 'Address' in df_match_with_url.columns:
-                    rename_dict = {}
-                    for existing_col in df_final.columns:
-                        if existing_col.startswith('Address') and existing_col != 'Address':
-                            rename_dict[existing_col] = f"URL - {col} Match"
-                            break
-                    if rename_dict:
-                        df_final.rename(columns=rename_dict, inplace=True)
+                # Rename URL column correctly
+                if f'Address_{col}' in df_final.columns:
+                    df_final.rename(columns={f'Address_{col}': f"URL - {col} Match"}, inplace=True)
                 
                 # Memory cleanup
                 del df_col_map, df_match_with_url
                 gc.collect()
+        
+        # Clean duplicate Address columns if they exist
+        address_cols = [col for col in df_final.columns if col.startswith('Address') and col != 'Address']
+        for col in address_cols:
+            if col in df_final.columns:
+                df_final.drop(columns=[col], inplace=True)
         
         return df_final
     
