@@ -1,4 +1,8 @@
-import streamlit as st
+# Lista di encoding da provare in ordine di priorità
+            encodings_to_try = [encoding, 'utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+            
+            # Rimuovi duplicati mantenendo l'ordine
+            encodings_to_try = list(dict.fromkeys(encodings_to_try))import streamlit as st
 import pandas as pd
 import numpy as np
 import time
@@ -131,7 +135,7 @@ class URLMigrationMapper:
         
         return is_valid, missing_columns, warnings
 
-    def load_csv_file(self, uploaded_file, filename: str) -> pd.DataFrame:
+    def load_csv_file(self, uploaded_file, filename: str, manual_encoding=None, manual_separator=None, skip_rows=0) -> pd.DataFrame:
         """Carica un file CSV gestendo diversi encoding e parametri"""
         try:
             # Leggi il contenuto del file come bytes
@@ -142,11 +146,12 @@ class URLMigrationMapper:
             encoding = self.detect_encoding(file_content)
             st.info(f"📄 Encoding rilevato per {filename}: {encoding}")
             
-            # Lista di encoding da provare in ordine di priorità
-            encodings_to_try = [encoding, 'utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+            # Se specificato encoding manuale, usalo per primo
+            if manual_encoding and manual_encoding != "Auto":
+                encodings_to_try = [manual_encoding] + [enc for enc in encodings_to_try if enc != manual_encoding]
             
-            # Rimuovi duplicati mantenendo l'ordine
-            encodings_to_try = list(dict.fromkeys(encodings_to_try))
+            # Determina il separatore
+            separator = None if manual_separator == "Auto" else manual_separator
             
             df = None
             last_error = None
@@ -155,16 +160,27 @@ class URLMigrationMapper:
                 try:
                     uploaded_file.seek(0)  # Reset file pointer
                     
+                    # Parametri base per pandas
+                    read_params = {
+                        'encoding': enc,
+                        'dtype': 'object',
+                        'na_values': ['', 'N/A', 'NULL', 'null', 'NaN'],
+                        'keep_default_na': True,
+                        'skiprows': skip_rows if skip_rows > 0 else None
+                    }
+                    
+                    # Aggiungi separatore se specificato
+                    if separator:
+                        read_params['sep'] = separator
+                    
                     # Parametri ottimizzati per file grandi
-                    df = pd.read_csv(
-                        uploaded_file,
-                        encoding=enc,
-                        engine='c',  # Usa engine C invece di python
-                        low_memory=False,
-                        dtype='object',  # Carica tutto come object inizialmente
-                        na_values=['', 'N/A', 'NULL', 'null', 'NaN'],
-                        keep_default_na=True
-                    )
+                    try:
+                        # Prima prova con engine C (più veloce)
+                        df = pd.read_csv(uploaded_file, engine='c', **read_params)
+                    except Exception:
+                        # Se engine C fallisce, usa engine Python senza low_memory
+                        uploaded_file.seek(0)
+                        df = pd.read_csv(uploaded_file, engine='python', **read_params)
                     
                     st.success(f"✅ File {filename} caricato con encoding: {enc}")
                     return df
@@ -176,6 +192,25 @@ class URLMigrationMapper:
                     last_error = f"Errore generico con {enc}: {str(e)}"
                     continue
             
+            # Se nessun encoding ha funzionato, prova un approccio più semplice
+            if df is None:
+                st.warning("🔄 Tentativo con parametri di base...")
+                try:
+                    uploaded_file.seek(0)
+                    # Approccio più basilare senza specificare engine
+                    df = pd.read_csv(uploaded_file, encoding='utf-8', sep=None, engine='python')
+                    st.success(f"✅ File {filename} caricato con approccio di fallback")
+                    return df
+                except Exception as e:
+                    try:
+                        uploaded_file.seek(0)
+                        # Ultimo tentativo con latin-1 (accetta qualsiasi byte)
+                        df = pd.read_csv(uploaded_file, encoding='latin-1', sep=None, engine='python')
+                        st.success(f"✅ File {filename} caricato con encoding latin-1 (fallback)")
+                        return df
+                    except Exception as final_error:
+                        last_error = f"Fallback finale fallito: {str(final_error)}"
+            
             # Se arriviamo qui, nessun encoding ha funzionato
             raise Exception(f"Impossibile caricare il file con nessuno degli encoding testati. Ultimo errore: {last_error}")
             
@@ -183,13 +218,25 @@ class URLMigrationMapper:
             st.error(f"❌ Errore nel caricamento del file {filename}")
             st.error(f"Dettaglio errore: {str(e)}")
             
+            # Aggiungi un'anteprima del contenuto del file per debugging
+            try:
+                uploaded_file.seek(0)
+                raw_content = uploaded_file.read(500)  # Primi 500 bytes
+                st.text_area("🔍 Anteprima contenuto file (primi 500 caratteri):", 
+                           value=str(raw_content), height=100)
+            except:
+                pass
+            
             # Mostra suggerimenti per la risoluzione
             st.markdown("""
             **🔧 Possibili soluzioni:**
-            1. **Controlla l'encoding**: Apri il file in un editor di testo e salvalo come UTF-8
-            2. **Verifica il formato**: Assicurati che sia un file CSV valido
+            1. **Controlla il separatore**: Il file usa virgole, punto e virgola o tab?
+            2. **Verifica l'encoding**: Apri il file in un editor di testo e salvalo come UTF-8
             3. **Caratteri speciali**: Rimuovi caratteri speciali non standard dal file
-            4. **Dimensione file**: Se il file è molto grande (>100MB), prova a dividerlo
+            4. **Formato**: Assicurati che sia un file CSV valido con intestazioni
+            5. **Dimensione**: Se il file è molto grande (>100MB), prova a dividerlo
+            
+            **💡 Suggerimento rapido**: Apri il file in Excel e salvalo come "CSV UTF-8 (delimitato da virgole)"
             """)
             
             return None
@@ -205,18 +252,38 @@ class URLMigrationMapper:
     
     def preprocess_dataframe(self, df: pd.DataFrame, required_columns: List[str]) -> pd.DataFrame:
         """Preprocessa il dataframe con ottimizzazioni per la memoria"""
+        
+        # Gestione colonne duplicate
+        if df.columns.duplicated().any():
+            st.warning("⚠️ Rilevate colonne duplicate nel file. Procedo con la rimozione...")
+            # Rinomina colonne duplicate aggiungendo suffisso
+            cols = df.columns.tolist()
+            seen = {}
+            for i, col in enumerate(cols):
+                if col in seen:
+                    seen[col] += 1
+                    cols[i] = f"{col}_{seen[col]}"
+                else:
+                    seen[col] = 0
+            df.columns = cols
+        
         # Converti i tipi di dati per ottimizzare la memoria
         for col in df.columns:
             if col in ['Address', 'Title 1', 'H1-1'] + required_columns:
-                df[col] = df[col].astype('string')
+                if col in df.columns:
+                    df[col] = df[col].astype('string')
         
         # Gestisci Status Code
         if 'Status Code' in df.columns:
             df['Status Code'] = pd.to_numeric(df['Status Code'], errors='coerce').fillna(0).astype('int16')
         
-        # Rimuovi duplicati
+        # Rimuovi duplicati solo se esiste la colonna Address
         if 'Address' in df.columns:
+            initial_rows = len(df)
             df.drop_duplicates(subset="Address", inplace=True)
+            removed_rows = initial_rows - len(df)
+            if removed_rows > 0:
+                st.info(f"🧹 Rimossi {removed_rows} duplicati basati su Address")
         
         return df
     
@@ -306,12 +373,46 @@ class URLMigrationMapper:
         
         return final_matches
     
+    def clean_dataframe_for_matching(self, df: pd.DataFrame, file_type: str) -> pd.DataFrame:
+        """Pulisce il dataframe per il matching rimuovendo colonne problematiche"""
+        
+        # Mostra info sulle colonne originali
+        st.info(f"📊 {file_type} - Colonne originali: {len(df.columns)}")
+        
+        # Lista delle colonne essenziali da mantenere
+        essential_columns = [
+            'Address', 'Status Code', 'Title 1', 'H1-1', 
+            'Meta Description 1', 'Canonical Link Element 1',
+            'Indexability', 'Content Type'
+        ]
+        
+        # Mantieni solo le colonne che esistono
+        columns_to_keep = [col for col in essential_columns if col in df.columns]
+        
+        # Aggiungi eventuali colonne extra specificate dall'utente
+        extra_cols = getattr(self, 'extra_columns', [])
+        for col in extra_cols:
+            if col in df.columns and col not in columns_to_keep:
+                columns_to_keep.append(col)
+        
+        # Filtra il dataframe
+        df_cleaned = df[columns_to_keep].copy()
+        
+        st.success(f"✅ {file_type} - Colonne mantenute: {len(df_cleaned.columns)}")
+        
+        return df_cleaned
+
     def process_migration_mapping(self, df_live: pd.DataFrame, df_staging: pd.DataFrame, 
                                 extra_columns: List[str] = None, use_ai: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Processo principale di mapping delle URL"""
         
         start_time = time.time()
         extra_columns = extra_columns or []
+        self.extra_columns = extra_columns  # Salva per clean_dataframe_for_matching
+        
+        # Pulizia iniziale dei dataframe
+        df_live = self.clean_dataframe_for_matching(df_live, "Live")
+        df_staging = self.clean_dataframe_for_matching(df_staging, "Staging")
         
         # Informazioni sui file
         live_info = self.get_file_info(df_live)
@@ -336,9 +437,13 @@ class URLMigrationMapper:
         df_live = df_live[available_live_cols].copy()
         df_staging = df_staging[available_staging_cols].copy()
         
-        # Preprocess
+        # Preprocessing con gestione migliorata delle colonne
         df_live = self.preprocess_dataframe(df_live, extra_columns)
         df_staging = self.preprocess_dataframe(df_staging, extra_columns)
+        
+        # Debug info
+        st.info(f"🔍 Colonne Live dopo preprocessing: {list(df_live.columns)}")
+        st.info(f"🔍 Colonne Staging dopo preprocessing: {list(df_staging.columns)}")
         
         # Gestione status codes
         df_3xx_5xx = pd.DataFrame()
@@ -382,11 +487,14 @@ class URLMigrationMapper:
             if col in df_staging.columns:
                 staging_lookup[col] = df_staging[[col, 'Address']].drop_duplicates(col)
         
-        # Costruzione risultato finale
+        # Costruzione risultato finale con gestione migliorata del merge
         df_final = df_live.copy()
         
-        # Merge dei match results
-        for col, match_df in matches.items():
+        # Rinomina colonne per evitare conflitti nel merge
+        base_columns = ['Address', 'Status Code', 'Title 1', 'H1-1']
+        
+        # Merge dei match results con suffissi per evitare conflitti
+        for i, (col, match_df) in enumerate(matches.items()):
             if not match_df.empty and col in staging_lookup:
                 # Rename columns per il merge
                 match_df_renamed = match_df.rename(columns={
@@ -395,22 +503,24 @@ class URLMigrationMapper:
                     'To': f'To_{col}'
                 })
                 
-                # Merge con lookup
+                # Merge con lookup usando suffissi appropriati
                 merged = pd.merge(
                     match_df_renamed, 
                     staging_lookup[col], 
                     left_on=f'To_{col}', 
                     right_on=col, 
-                    how='inner'
+                    how='inner',
+                    suffixes=('', f'_staging_{i}')
                 )
                 
-                # Merge con df_final
+                # Merge con df_final usando suffissi per evitare duplicati
                 df_final = pd.merge(
                     df_final, 
                     merged, 
                     left_on=col, 
                     right_on=f'From_{col}', 
-                    how='left'
+                    how='left',
+                    suffixes=('', f'_match_{i}')
                 )
         
         # Calcolo best match
@@ -421,12 +531,23 @@ class URLMigrationMapper:
             df_final['Best_Match_On'] = df_final[similarity_cols].idxmax(axis=1)
             df_final['Highest_Match_Similarity'] = df_final[similarity_cols].max(axis=1)
             
-            # Determina Best Matching URL
+            # Determina Best Matching URL con gestione colonne dinamiche
             for col in columns_to_match:
                 sim_col = f'{col}_Similarity'
                 if sim_col in df_final.columns:
                     mask = df_final['Best_Match_On'] == sim_col
-                    df_final.loc[mask, 'Best_Matching_URL'] = df_final.loc[mask, 'Address_y']
+                    
+                    # Trova la colonna Address corrispondente al match
+                    address_cols = [c for c in df_final.columns if 'Address' in c and c.endswith(f'_match_{list(matches.keys()).index(col)}')]
+                    if address_cols:
+                        target_col = address_cols[0]
+                    else:
+                        # Fallback: cerca qualsiasi colonna Address disponibile dal merge
+                        address_cols = [c for c in df_final.columns if 'Address' in c and c != 'Address']
+                        target_col = address_cols[0] if address_cols else 'Address'
+                    
+                    if target_col in df_final.columns:
+                        df_final.loc[mask, 'Best_Matching_URL'] = df_final.loc[mask, target_col]
         
         # AI Enhancement per URL non matchate (se abilitato)
         if use_ai and self.openai_client:
@@ -512,6 +633,32 @@ def main():
     # Upload dei file
     st.header("📁 Upload File")
     
+    # Opzioni avanzate per file problematici
+    with st.expander("⚙️ Opzioni Avanzate per File Problematici"):
+        st.markdown("**Usa queste opzioni se hai problemi nel caricamento:**")
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            manual_encoding = st.selectbox(
+                "Encoding manuale", 
+                ["Auto", "utf-8", "latin-1", "cp1252", "iso-8859-1"],
+                help="Specifica l'encoding se il rilevamento automatico fallisce"
+            )
+        
+        with col2:
+            manual_separator = st.selectbox(
+                "Separatore", 
+                ["Auto", ",", ";", "\t", "|"],
+                help="Specifica il separatore se diverso dalla virgola"
+            )
+        
+        with col3:
+            skip_rows = st.number_input(
+                "Righe da saltare", 
+                min_value=0, max_value=10, value=0,
+                help="Salta le prime N righe se ci sono intestazioni multiple"
+            )
+    
     col1, col2 = st.columns(2)
     
     with col1:
@@ -526,8 +673,12 @@ def main():
         try:
             # Caricamento file con gestione encoding migliorata
             with st.spinner("Caricamento file..."):
-                df_live = mapper.load_csv_file(live_file, "Live")
-                df_staging = mapper.load_csv_file(staging_file, "Staging")
+                # Converti None a "Auto" per compatibilità
+                enc_param = None if manual_encoding == "Auto" else manual_encoding
+                sep_param = None if manual_separator == "Auto" else manual_separator
+                
+                df_live = mapper.load_csv_file(live_file, "Live", enc_param, sep_param, skip_rows)
+                df_staging = mapper.load_csv_file(staging_file, "Staging", enc_param, sep_param, skip_rows)
             
             # Controlla se il caricamento è riuscito
             if df_live is None or df_staging is None:
