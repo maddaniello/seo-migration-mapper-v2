@@ -129,26 +129,46 @@ class URLMigrationMapper:
         if len(df.columns) != len(set(df.columns)):
             st.warning("⚠️ Colonne duplicate rilevate, pulizia in corso...")
             
+            # Create a mapping of old to new column names
             new_columns = []
             seen_columns = {}
             
             for col in df.columns:
                 if col in seen_columns:
                     seen_columns[col] += 1
-                    new_col = f"{col}_{seen_columns[col]}"
+                    new_col = f"{col}_duplicate_{seen_columns[col]}"
                 else:
                     seen_columns[col] = 0
                     new_col = col
                 new_columns.append(new_col)
             
+            # Assign new column names
             df.columns = new_columns
             
-            address_variants = [col for col in df.columns if 'Address' in col and col != 'Address']
-            for col in address_variants:
-                if col.endswith('_1') or col.endswith('_2') or col.endswith('_3'):
-                    df.drop(columns=[col], inplace=True, errors='ignore')
+            # Remove obviously duplicate Address columns (keep only the main one)
+            duplicate_address_cols = [col for col in df.columns if col.startswith('Address_duplicate_')]
+            if duplicate_address_cols:
+                df.drop(columns=duplicate_address_cols, inplace=True, errors='ignore')
+                st.info(f"🗑️ Rimosse colonne duplicate: {duplicate_address_cols}")
             
             st.info(f"✅ Colonne pulite: {len(df.columns)} colonne rimanenti")
+        
+        return df
+
+    def ensure_unique_columns(self, df: pd.DataFrame, operation_name: str = "") -> pd.DataFrame:
+        """Ensure all columns have unique names before operations"""
+        if len(df.columns) != len(set(df.columns)):
+            st.warning(f"⚠️ Colonne duplicate trovate prima di {operation_name}. Correzione in corso...")
+            
+            # Make columns unique by adding suffix
+            cols = pd.Series(df.columns)
+            for dup in cols[cols.duplicated()].unique():
+                mask = cols == dup
+                cols[mask] = [f"{dup}_v{i}" if i != 0 else dup for i in range(mask.sum())]
+            
+            df.columns = cols
+            
+            st.info(f"✅ Colonne rese uniche per {operation_name}")
         
         return df
     
@@ -160,9 +180,11 @@ class URLMigrationMapper:
         df_live = df_live.copy()
         df_staging = df_staging.copy()
         
-        df_live = self.clean_duplicate_columns(df_live)
-        df_staging = self.clean_duplicate_columns(df_staging)
+        # Clean duplicate columns FIRST - this is critical
+        df_live = self.ensure_unique_columns(df_live, "preprocessing df_live")
+        df_staging = self.ensure_unique_columns(df_staging, "preprocessing df_staging")
         
+        # Optimize data types to save memory
         for col in df_live.columns:
             if df_live[col].dtype == 'object':
                 df_live[col] = df_live[col].astype('string')
@@ -171,12 +193,23 @@ class URLMigrationMapper:
             if df_staging[col].dtype == 'object':
                 df_staging[col] = df_staging[col].astype('string')
         
+        # Ensure required columns exist
         for col in matching_columns:
             if col not in df_live.columns:
                 df_live[col] = ""
             if col not in df_staging.columns:
                 df_staging[col] = ""
         
+        # Verify Address column exists and is unique
+        if 'Address' not in df_live.columns:
+            st.error("❌ Colonna 'Address' mancante nel file PRE")
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        
+        if 'Address' not in df_staging.columns:
+            st.error("❌ Colonna 'Address' mancante nel file POST")
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        
+        # Drop duplicates with progress tracking
         initial_live_count = len(df_live)
         initial_staging_count = len(df_staging)
         
@@ -185,22 +218,30 @@ class URLMigrationMapper:
         
         st.write(f"📊 Duplicati rimossi: Live {initial_live_count - len(df_live)}, Staging {initial_staging_count - len(df_staging)}")
         
+        # Extract non-redirectable URLs (3xx & 5xx)
         df_3xx = df_live[(df_live['Status Code'] >= 300) & (df_live['Status Code'] <= 308)].copy()
         df_5xx = df_live[(df_live['Status Code'] >= 500) & (df_live['Status Code'] <= 599)].copy()
         df_non_redirectable = pd.concat([df_3xx, df_5xx]) if not df_3xx.empty or not df_5xx.empty else pd.DataFrame()
         
+        # Keep 2xx and 4xx status codes for redirecting
         df_live_200 = df_live[(df_live['Status Code'] >= 200) & (df_live['Status Code'] <= 226)].copy()
         df_live_400 = df_live[(df_live['Status Code'] >= 400) & (df_live['Status Code'] <= 499)].copy()
         df_live_clean = pd.concat([df_live_200, df_live_400]) if not df_live_200.empty or not df_live_400.empty else pd.DataFrame()
         
+        # Clean up intermediate dataframes
         del df_3xx, df_5xx, df_live_200, df_live_400
         gc.collect()
         
+        # Handle NaN values - populate with URL for 404s
         for col in matching_columns:
             if col in df_live_clean.columns:
                 df_live_clean[col] = df_live_clean[col].fillna(df_live_clean['Address'])
             if col in df_staging.columns:
                 df_staging[col] = df_staging[col].fillna(df_staging['Address'])
+        
+        # Final check for unique columns
+        df_live_clean = self.ensure_unique_columns(df_live_clean, "final df_live_clean")
+        df_staging = self.ensure_unique_columns(df_staging, "final df_staging")
         
         st.write(f"✅ Preprocessing completato: {len(df_live_clean):,} URL processabili, {len(df_non_redirectable):,} non-redirectable")
         
@@ -340,45 +381,93 @@ class URLMigrationMapper:
                            matches: Dict[str, pd.DataFrame], matching_columns: List[str]) -> pd.DataFrame:
         """Merge all matches into final dataframe with memory optimization"""
         
-        df_final = df_live[['Address', 'Status Code'] + matching_columns].copy()
+        # Ensure unique columns before starting
+        df_live = self.ensure_unique_columns(df_live, "merge_matches_batch - df_live")
+        df_staging = self.ensure_unique_columns(df_staging, "merge_matches_batch - df_staging")
         
-        if 'Address' in matches:
-            df_final = pd.merge(df_final, matches['Address'], 
-                              left_on="Address", right_on="From (Address)", 
-                              how="left", suffixes=('', '_url_match'))
-            df_final.rename(columns={"To Address": "URL - URL Match"}, inplace=True)
+        # Start with a base dataframe - only select columns that exist
+        base_columns = ['Address', 'Status Code']
+        available_columns = [col for col in base_columns if col in df_live.columns]
+        available_matching_columns = [col for col in matching_columns if col in df_live.columns]
         
-        df_final = self.clean_duplicate_columns(df_final)
+        df_final = df_live[available_columns + available_matching_columns].copy()
         
+        # Ensure df_final has unique columns
+        df_final = self.ensure_unique_columns(df_final, "df_final initial")
+        
+        # Add Address matching if available
+        if 'Address' in matches and 'Address' in df_final.columns:
+            try:
+                # Double check that Address column is unique in df_final
+                if df_final.columns.duplicated().any():
+                    df_final = self.ensure_unique_columns(df_final, "before Address merge")
+                
+                # Perform the merge with explicit error handling
+                df_final = pd.merge(df_final, matches['Address'], 
+                                  left_on="Address", right_on="From (Address)", 
+                                  how="left", suffixes=('', '_url_match'))
+                
+                # Rename the URL column
+                if "To Address" in df_final.columns:
+                    df_final.rename(columns={"To Address": "URL - URL Match"}, inplace=True)
+                
+            except ValueError as e:
+                st.error(f"Errore nel merge Address: {str(e)}")
+                st.write("Colonne df_final:", list(df_final.columns))
+                st.write("Colonne matches['Address']:", list(matches['Address'].columns))
+                # Skip Address matching if there's an error
+        
+        # Clean any duplicate columns that might have been created
+        df_final = self.ensure_unique_columns(df_final, "after Address merge")
+        
+        # Merge other columns in batches to manage memory
         for col in matching_columns:
             if col == 'Address':
                 continue
                 
-            if col in matches:
-                df_col_map = df_staging[[col, 'Address']].drop_duplicates(col)
-                df_col_map.rename(columns={'Address': f'Address_{col}'}, inplace=True)
-                
-                df_match_with_url = pd.merge(
-                    matches[col], df_col_map, 
-                    left_on=f"To {col}", right_on=col, 
-                    how="left"
-                )
-                
-                df_match_with_url = df_match_with_url.drop_duplicates(f"From ({col})")
-                
-                df_final = df_final.merge(
-                    df_match_with_url, 
-                    how='left', left_on=col, right_on=f"From ({col})",
-                    suffixes=('', f'_{col.lower().replace(" ", "_")}')
-                )
-                
-                if f'Address_{col}' in df_final.columns:
-                    df_final.rename(columns={f'Address_{col}': f"URL - {col} Match"}, inplace=True)
-                
-                df_final = self.clean_duplicate_columns(df_final)
-                
-                del df_col_map, df_match_with_url
-                gc.collect()
+            if col in matches and col in df_staging.columns:
+                try:
+                    # Create mapping dataframe
+                    df_col_map = df_staging[[col, 'Address']].drop_duplicates(col)
+                    
+                    # Rename Address column to avoid conflicts
+                    df_col_map.rename(columns={'Address': f'TargetURL_{col}'}, inplace=True)
+                    
+                    # Merge with matches
+                    df_match_with_url = pd.merge(
+                        matches[col], df_col_map, 
+                        left_on=f"To {col}", right_on=col, 
+                        how="left"
+                    )
+                    
+                    # Clean duplicates
+                    df_match_with_url = df_match_with_url.drop_duplicates(f"From ({col})")
+                    
+                    # Ensure unique columns before merge
+                    df_final = self.ensure_unique_columns(df_final, f"before {col} merge")
+                    df_match_with_url = self.ensure_unique_columns(df_match_with_url, f"{col} match data")
+                    
+                    # Merge with final dataframe
+                    df_final = df_final.merge(
+                        df_match_with_url, 
+                        how='left', left_on=col, right_on=f"From ({col})",
+                        suffixes=('', f'_{col.lower().replace(" ", "_").replace("-", "_")}')
+                    )
+                    
+                    # Rename URL column correctly
+                    if f'TargetURL_{col}' in df_final.columns:
+                        df_final.rename(columns={f'TargetURL_{col}': f"URL - {col} Match"}, inplace=True)
+                    
+                    # Clean duplicate columns after each merge
+                    df_final = self.ensure_unique_columns(df_final, f"after {col} merge")
+                    
+                    # Memory cleanup
+                    del df_col_map, df_match_with_url
+                    gc.collect()
+                    
+                except Exception as e:
+                    st.warning(f"⚠️ Errore nel merge della colonna {col}: {str(e)}. Saltata.")
+                    continue
         
         return df_final
     
