@@ -183,7 +183,7 @@ class URLMigrationMapper:
     
     def process_migration_mapping(self, df_live: pd.DataFrame, df_staging: pd.DataFrame, 
                                 extra_columns: List[str] = None, use_ai: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Processo principale - MANTIENE STRUTTURA ORIGINALE"""
+        """Processo principale - STRUTTURA ORIGINALE SEMPLIFICATA"""
         
         start_time = time.time()
         extra_columns = extra_columns or []
@@ -194,7 +194,9 @@ class URLMigrationMapper:
         - **Staging**: {len(df_staging):,} righe, {len(df_staging.columns)} colonne
         """)
         
-        # Preprocessing SEMPLIFICATO come nel codice originale
+        # Preprocessing SEMPLIFICATO - ESATTAMENTE come nel codice originale
+        print(f"Inizio elaborazione alle {time.strftime('%H:%M:%S')}")
+        
         # Converti Status Code
         df_live['Status Code'] = pd.to_numeric(df_live['Status Code'], errors='coerce').fillna(0).astype('int16')
         df_staging['Status Code'] = pd.to_numeric(df_staging['Status Code'], errors='coerce').fillna(0).astype('int16')
@@ -203,9 +205,9 @@ class URLMigrationMapper:
         df_live.drop_duplicates(subset="Address", inplace=True)
         df_staging.drop_duplicates(subset="Address", inplace=True)
         
-        st.info(f"Dopo rimozione duplicati: Live={len(df_live)} righe, Staging={len(df_staging)} righe")
+        print(f"Dopo rimozione duplicati: Live={len(df_live)} righe, Staging={len(df_staging)} righe")
         
-        # Gestione status codes come nel codice originale
+        # Gestione status codes ESATTAMENTE come nel codice originale
         df_3xx = df_live[(df_live['Status Code'] >= 300) & (df_live['Status Code'] <= 308)]
         df_5xx = df_live[(df_live['Status Code'] >= 500) & (df_live['Status Code'] <= 599)]
         df_3xx_5xx = pd.concat([df_3xx, df_5xx])
@@ -215,58 +217,59 @@ class URLMigrationMapper:
         df_live_400 = df_live[(df_live['Status Code'] >= 400) & (df_live['Status Code'] <= 499)]
         df_live = pd.concat([df_live_200, df_live_400])
         
-        st.info(f"URL processabili: {len(df_live)} righe")
+        print(f"URL processabili: {len(df_live)} righe")
         
-        # Gestione valori mancanti come nel codice originale
+        # Gestione valori mancanti ESATTAMENTE come nel codice originale
         df_live["Title 1"] = df_live["Title 1"].fillna(df_live["Address"])
         df_live["H1-1"] = df_live["H1-1"].fillna(df_live["Address"])
         df_staging["Title 1"] = df_staging["Title 1"].fillna(df_staging["Address"])
         df_staging["H1-1"] = df_staging["H1-1"].fillna(df_staging["Address"])
         
-        # MATCHING con struttura originale
-        st.info("🔄 Inizio matching...")
-        
-        # URL matching
+        # MATCHING ESATTAMENTE come nel codice originale
+        print("Inizio matching degli URL...")
         df_pf_url = self.chunked_polyfuzz_matching(
             list(df_live["Address"]), 
             list(df_staging["Address"]), 
             match_type="URL"
         )
         
-        # Title matching
+        print("Inizio matching dei titoli...")
         df_pf_title = self.chunked_polyfuzz_matching(
             list(df_live["Title 1"]), 
             list(df_staging["Title 1"]), 
             match_type="Title"
         )
         
-        # H1 matching
+        print("Inizio matching degli H1...")
         df_pf_h1 = self.chunked_polyfuzz_matching(
             list(df_live["H1-1"]), 
             list(df_staging["H1-1"]), 
             match_type="H1"
         )
         
-        # Rinomina colonne come nel codice originale
+        # Rinomina colonne ESATTAMENTE come nel codice originale
         df_pf_url.rename(columns={"Similarity": "URL Similarity", "From": "From (Address)", "To": "To Address"}, inplace=True)
         df_pf_title.rename(columns={"Similarity": "Title Similarity", "From": "From (Title)", "To": "To Title"}, inplace=True)
         df_pf_h1.rename(columns={"Similarity": "H1 Similarity", "From": "From (H1)", "To": "To H1"}, inplace=True)
         
-        # Preparazione merge come nel codice originale
+        print("Preparazione merge dei risultati...")
+        
+        # Preparazione merge ESATTAMENTE come nel codice originale
         df_new_title = df_staging[['Title 1', 'Address']].drop_duplicates('Title 1')
         df_new_h1 = df_staging[['H1-1', 'Address']].drop_duplicates('H1-1')
         
-        # Merge come nel codice originale
-        st.info("🔄 Merge dei dati...")
+        # Merge ESATTAMENTE come nel codice originale
+        print("Merge dei dati di matching...")
         df_pf_title_merge = pd.merge(df_pf_title, df_new_title, left_on="To Title", right_on="Title 1", how="inner")
         df_pf_h1_merge = pd.merge(df_pf_h1, df_new_h1, left_on="To H1", right_on="H1-1", how="inner")
         
-        # Costruzione finale come nel codice originale
+        # Costruzione finale ESATTAMENTE come nel codice originale
+        print("Creazione dataset finale...")
         df_final = pd.merge(df_live, df_pf_url, left_on="Address", right_on="From (Address)", how="inner")
         df_final = df_final.merge(df_pf_title_merge.drop_duplicates('Title 1'), how='left', left_on='Title 1', right_on="From (Title)")
         df_final = df_final.merge(df_pf_h1_merge.drop_duplicates('H1-1'), how='left', left_on='H1-1', right_on="From (H1)")
         
-        # Rinomina colonne come nel codice originale
+        # Rinomina colonne ESATTAMENTE come nel codice originale
         df_final.rename(
             columns={
                 "Address_x": "URL - Source",
@@ -277,13 +280,15 @@ class URLMigrationMapper:
             inplace=True,
         )
         
-        # Calcolo best match come nel codice originale
+        print("Calcolo dei match migliori...")
+        
+        # Calcolo best match ESATTAMENTE come nel codice originale
         similarity_cols = ["URL Similarity", "Title Similarity", "H1 Similarity"]
         df_final[similarity_cols] = df_final[similarity_cols].fillna(0)
         
         df_final['Best Match On'] = df_final[similarity_cols].idxmax(axis=1)
         
-        # Best match logic come nel codice originale
+        # Best match logic ESATTAMENTE come nel codice originale
         df_final.loc[df_final['Best Match On'] == "Title Similarity", 'Highest Match Similarity'] = df_final['Title Similarity']
         df_final.loc[df_final['Best Match On'] == "Title Similarity", 'Best Matching URL'] = df_final['URL - Title Match']
         df_final.loc[df_final['Best Match On'] == "H1 Similarity", 'Highest Match Similarity'] = df_final['H1 Similarity']
@@ -295,7 +300,7 @@ class URLMigrationMapper:
         
         # AI Enhancement se abilitato
         if use_ai and self.openai_client:
-            st.info("🤖 AI Enhancement in corso...")
+            print("🤖 AI Enhancement in corso...")
             unmatched_mask = df_final['Highest Match Similarity'].fillna(0) < self.min_similarity_threshold
             unmatched_urls = df_final[unmatched_mask]['URL - Source'].tolist()
             
@@ -315,10 +320,16 @@ class URLMigrationMapper:
         df_final.sort_values("Highest Match Similarity", ascending=False, inplace=True)
         
         # Statistiche finali
-        processing_time = time.time() - start_time
+        end_time = time.time()
+        total_time = end_time - start_time
+        
+        print(f"\n🎉 ELABORAZIONE COMPLETATA! 🎉")
+        print(f"⏱️  Tempo totale: {total_time:.2f} secondi ({total_time/60:.1f} minuti)")
+        print(f"📊 URL processati: {len(df_final)}")
+        
         st.success(f"""
         🎉 **Elaborazione completata!**
-        - ⏱️ Tempo: {processing_time:.1f} secondi
+        - ⏱️ Tempo: {total_time:.1f} secondi
         - 📊 URL processati: {len(df_final):,}
         - 🎯 Match trovati: {len(df_final[df_final['Highest Match Similarity'] > self.min_similarity_threshold]):,}
         """)
