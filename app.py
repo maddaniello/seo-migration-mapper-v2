@@ -104,27 +104,71 @@ class LanguageDetector:
         return None
     
     @classmethod
+    def normalize_language_code(cls, lang_code: str) -> str:
+        """
+        Normalizza i codici lingua per gestire varianti simili.
+        Esempi:
+        - 'it-IT' -> 'it'
+        - 'IT' -> 'it'
+        - 'en-US' -> 'en'
+        - 'en_GB' -> 'en'
+        """
+        if pd.isna(lang_code) or not lang_code:
+            return 'unknown'
+        
+        lang_code = str(lang_code).lower().strip()
+        
+        # Rimuovi spazi extra
+        lang_code = lang_code.replace(' ', '')
+        
+        # Gestisci formati con separatori (it-IT, en_US, it-it, etc.)
+        if '-' in lang_code:
+            # Prendi solo la prima parte (it-IT -> it)
+            lang_code = lang_code.split('-')[0]
+        elif '_' in lang_code:
+            # Prendi solo la prima parte (en_US -> en)
+            lang_code = lang_code.split('_')[0]
+        
+        # Verifica che sia un codice lingua valido
+        if lang_code in cls.COMMON_LANGUAGES:
+            return lang_code
+        
+        # Se non è valido, ritorna unknown
+        if len(lang_code) != 2:
+            return 'unknown'
+        
+        return lang_code
+    
+    @classmethod
     def add_language_column(cls, df: pd.DataFrame, url_column: str = 'Address', 
                            language_column: str = 'language') -> pd.DataFrame:
         """
         Aggiunge o aggiorna la colonna lingua nel dataframe.
         Se la colonna lingua esiste già, la usa; altrimenti la rileva dall'URL.
+        Normalizza automaticamente i codici lingua (it-IT -> it, IT -> it, etc.)
         """
         df = df.copy()
         
         # Se la colonna lingua esiste già e ha valori, usala
         if language_column in df.columns:
-            # Rileva solo per righe senza lingua
-            mask_missing = df[language_column].isna() | (df[language_column] == '')
-            if mask_missing.any():
-                df.loc[mask_missing, language_column] = df.loc[mask_missing, url_column].apply(
-                    cls.detect_language_from_url
-                )
             # Normalizza i valori esistenti
-            df[language_column] = df[language_column].str.lower().str.strip()
+            df[language_column] = df[language_column].apply(cls.normalize_language_code)
+            
+            # Rileva solo per righe senza lingua o con 'unknown'
+            mask_missing = df[language_column].isna() | (df[language_column] == '') | (df[language_column] == 'unknown')
+            if mask_missing.any():
+                detected_langs = df.loc[mask_missing, url_column].apply(cls.detect_language_from_url)
+                # Normalizza anche le lingue rilevate
+                df.loc[mask_missing, language_column] = detected_langs.apply(
+                    lambda x: cls.normalize_language_code(x) if x else 'unknown'
+                )
         else:
-            # Crea la colonna ex-novo
+            # Crea la colonna ex-novo rilevando dall'URL
             df[language_column] = df[url_column].apply(cls.detect_language_from_url)
+            # Normalizza
+            df[language_column] = df[language_column].apply(
+                lambda x: cls.normalize_language_code(x) if x else 'unknown'
+            )
         
         # Riempi i valori mancanti con 'unknown'
         df[language_column] = df[language_column].fillna('unknown')
