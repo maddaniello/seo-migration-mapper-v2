@@ -60,13 +60,17 @@ class LanguageDetector:
     }
     
     @classmethod
-    def detect_language_from_url(cls, url: str) -> Optional[str]:
+    def detect_language_from_url(cls, url: str, default_language: Optional[str] = None) -> Optional[str]:
         """
         Rileva la lingua dall'URL usando vari pattern.
-        Ritorna il codice lingua (es: 'it', 'en') o None se non rilevato.
+        Ritorna il codice lingua (es: 'it', 'en') o la lingua di default se specificata.
+        
+        Args:
+            url: URL da analizzare
+            default_language: Lingua da assegnare se nessun pattern viene trovato (es: 'it' per lingua principale)
         """
         if pd.isna(url) or not url:
-            return None
+            return default_language
         
         url = str(url).lower()
         parsed = urlparse(url)
@@ -101,7 +105,8 @@ class LanguageDetector:
             if lang in cls.COMMON_LANGUAGES:
                 return lang
         
-        return None
+        # Se nessun pattern trovato, usa la lingua di default (se specificata)
+        return default_language
     
     @classmethod
     def normalize_language_code(cls, lang_code: str) -> str:
@@ -141,11 +146,18 @@ class LanguageDetector:
     
     @classmethod
     def add_language_column(cls, df: pd.DataFrame, url_column: str = 'Address', 
-                           language_column: str = 'language') -> pd.DataFrame:
+                           language_column: str = 'language', 
+                           default_language: Optional[str] = None) -> pd.DataFrame:
         """
         Aggiunge o aggiorna la colonna lingua nel dataframe.
         Se la colonna lingua esiste già, la usa; altrimenti la rileva dall'URL.
         Normalizza automaticamente i codici lingua (it-IT -> it, IT -> it, etc.)
+        
+        Args:
+            df: DataFrame da processare
+            url_column: Nome della colonna con gli URL
+            language_column: Nome della colonna lingua
+            default_language: Lingua da assegnare alle URL senza pattern (es: 'it' per sito.com/page)
         """
         df = df.copy()
         
@@ -157,14 +169,18 @@ class LanguageDetector:
             # Rileva solo per righe senza lingua o con 'unknown'
             mask_missing = df[language_column].isna() | (df[language_column] == '') | (df[language_column] == 'unknown')
             if mask_missing.any():
-                detected_langs = df.loc[mask_missing, url_column].apply(cls.detect_language_from_url)
+                detected_langs = df.loc[mask_missing, url_column].apply(
+                    lambda x: cls.detect_language_from_url(x, default_language)
+                )
                 # Normalizza anche le lingue rilevate
                 df.loc[mask_missing, language_column] = detected_langs.apply(
                     lambda x: cls.normalize_language_code(x) if x else 'unknown'
                 )
         else:
             # Crea la colonna ex-novo rilevando dall'URL
-            df[language_column] = df[url_column].apply(cls.detect_language_from_url)
+            df[language_column] = df[url_column].apply(
+                lambda x: cls.detect_language_from_url(x, default_language)
+            )
             # Normalizza
             df[language_column] = df[language_column].apply(
                 lambda x: cls.normalize_language_code(x) if x else 'unknown'
@@ -274,7 +290,9 @@ class URLMigrationMapper:
     
     def process_migration_mapping(self, df_live: pd.DataFrame, df_staging: pd.DataFrame, 
                                 extra_columns: List[str] = None, use_ai: bool = False,
-                                use_language_matching: bool = True) -> Tuple[pd.DataFrame, pd.DataFrame]:
+                                use_language_matching: bool = True,
+                                default_lang_live: Optional[str] = None,
+                                default_lang_staging: Optional[str] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Processo principale con supporto multi-lingua"""
         
         start_time = time.time()
@@ -284,9 +302,15 @@ class URLMigrationMapper:
         if use_language_matching:
             st.info("🌍 Rilevamento lingue in corso...")
             
-            # Aggiungi colonna lingua (usa quella esistente o la rileva)
-            df_live = self.language_detector.add_language_column(df_live)
-            df_staging = self.language_detector.add_language_column(df_staging)
+            # Aggiungi colonna lingua con default language
+            df_live = self.language_detector.add_language_column(
+                df_live, 
+                default_language=default_lang_live
+            )
+            df_staging = self.language_detector.add_language_column(
+                df_staging,
+                default_language=default_lang_staging
+            )
             
             # Mostra statistiche lingue
             live_langs = df_live['language'].value_counts()
@@ -669,6 +693,9 @@ def main():
         help="Accoppia URL solo della stessa lingua. Se i CSV hanno una colonna 'language', verrà usata; altrimenti la lingua sarà rilevata automaticamente dall'URL."
     )
     
+    default_lang_live = None
+    default_lang_staging = None
+    
     if use_language_matching:
         st.sidebar.info("""
         **Come funziona:**
@@ -685,6 +712,63 @@ def main():
         - `/en/about` ↔ `/en/about-us` ✅
         - `/it/chi-siamo` ↔ `/it/about` ❌
         """)
+        
+        # Configurazione lingua di default
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("**⚙️ Lingua Principale (senza pattern)**")
+        st.sidebar.caption("Se il tuo sito non usa sottocartelle/sottodomini per la lingua principale:")
+        
+        col1, col2 = st.sidebar.columns(2)
+        
+        with col1:
+            use_default_live = st.checkbox(
+                "Live ha lingua default",
+                value=False,
+                help="Es: sito.com/pagina è in italiano, mentre sito.com/en/page è in inglese"
+            )
+            
+            if use_default_live:
+                default_lang_live = st.text_input(
+                    "Codice Live",
+                    value="it",
+                    max_chars=2,
+                    help="Codice ISO (es: it, en, fr, de)"
+                ).lower().strip()
+                
+                if len(default_lang_live) != 2:
+                    st.warning("⚠️ Usa 2 lettere (es: it)")
+                    default_lang_live = None
+        
+        with col2:
+            use_default_staging = st.checkbox(
+                "Staging ha lingua default",
+                value=False,
+                help="Es: sito.com/page è in inglese, mentre sito.com/it/pagina è in italiano"
+            )
+            
+            if use_default_staging:
+                default_lang_staging = st.text_input(
+                    "Codice Staging",
+                    value="en",
+                    max_chars=2,
+                    help="Codice ISO (es: it, en, fr, de)"
+                ).lower().strip()
+                
+                if len(default_lang_staging) != 2:
+                    st.warning("⚠️ Usa 2 lettere (es: en)")
+                    default_lang_staging = None
+        
+        # Esempi pratici
+        if use_default_live or use_default_staging:
+            st.sidebar.markdown("**💡 Esempi:**")
+            
+            if use_default_live and default_lang_live:
+                st.sidebar.success(f"✅ Live: `sito.com/page` → `{default_lang_live}`")
+                st.sidebar.info(f"ℹ️ Live: `sito.com/en/page` → `en` (rilevato)")
+            
+            if use_default_staging and default_lang_staging:
+                st.sidebar.success(f"✅ Staging: `sito.com/page` → `{default_lang_staging}`")
+                st.sidebar.info(f"ℹ️ Staging: `sito.com/it/page` → `it` (rilevato)")
     
     # Configurazione OpenAI
     st.sidebar.subheader("🤖 AI Enhancement")
@@ -770,7 +854,8 @@ def main():
             if st.button("🚀 Avvia Elaborazione", type="primary"):
                 with st.spinner("Elaborazione in corso..."):
                     df_final, df_non_redirectable = mapper.process_migration_mapping(
-                        df_live, df_staging, extra_columns, use_ai, use_language_matching
+                        df_live, df_staging, extra_columns, use_ai, use_language_matching,
+                        default_lang_live, default_lang_staging
                     )
                 
                 # Risultati
