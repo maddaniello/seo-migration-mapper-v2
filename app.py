@@ -566,26 +566,31 @@ class URLMigrationMapper:
         # VALIDAZIONE LINGUA: rimuovi match cross-lingua se language matching è attivo
         if use_language_matching and 'language' in df_final.columns:
             print("Validazione match per lingua...")
+            st.info("🔍 Validazione match per lingua in corso...")
+            
+            # Crea un dizionario per lookup veloce delle lingue in staging
+            staging_lang_lookup = df_staging.set_index('Address')['language'].to_dict()
             
             # Per ogni URL matchata, verifica la lingua
             def validate_language_match(row):
-                source_lang = row.get('language', 'unknown')
-                matched_url = row.get('Best Matching URL', '')
-                
-                if pd.isna(matched_url) or matched_url == '':
-                    return matched_url
-                
-                # Trova la lingua dell'URL di destinazione
-                target_row = df_staging[df_staging['Address'] == matched_url]
-                
-                if len(target_row) > 0 and 'language' in target_row.columns:
-                    target_lang = target_row.iloc[0]['language']
+                try:
+                    source_lang = row.get('language', 'unknown')
+                    matched_url = row.get('Best Matching URL', '')
+                    
+                    if pd.isna(matched_url) or matched_url == '':
+                        return matched_url
+                    
+                    # Trova la lingua dell'URL di destinazione usando il dizionario
+                    target_lang = staging_lang_lookup.get(matched_url, 'unknown')
                     
                     # Se le lingue sono diverse, invalida il match
                     if source_lang != target_lang:
                         return ''  # Rimuovi il match
-                
-                return matched_url
+                    
+                    return matched_url
+                except Exception as e:
+                    print(f"Errore validazione riga: {e}")
+                    return ''
             
             # Applica validazione
             df_final['Best Matching URL'] = df_final.apply(validate_language_match, axis=1)
@@ -599,13 +604,16 @@ class URLMigrationMapper:
             # Conta match invalidati
             invalidated_count = invalid_mask.sum()
             if invalidated_count > 0:
-                st.warning(f"⚠️ {invalidated_count} match cross-lingua invalidati (verranno spostati in 'non redirectable')")
+                st.warning(f"⚠️ {invalidated_count} match cross-lingua invalidati")
                 print(f"Match cross-lingua invalidati: {invalidated_count}")
         
         df_final.drop_duplicates(subset="URL - Source", inplace=True)
         
         # SEPARA URL NON MATCHATE (per inserirle in non-redirectable se language matching attivo)
         if use_language_matching:
+            print("Separazione URL non matchate...")
+            st.info("📋 Separazione URL non matchate...")
+            
             # URL con similarity troppo bassa o senza match vanno in non-redirectable
             no_match_mask = (
                 (df_final['Highest Match Similarity'].fillna(0) < self.min_similarity_threshold) |
@@ -616,8 +624,16 @@ class URLMigrationMapper:
             df_no_match = df_final[no_match_mask].copy()
             
             if len(df_no_match) > 0:
+                # Prepara dataframe per non redirectable
+                df_no_match_export = df_no_match[['URL - Source', 'Status Code']].copy()
+                df_no_match_export = df_no_match_export.rename(columns={'URL - Source': 'Address'})
+                
                 # Aggiungi alla lista di non redirectable
-                df_3xx_5xx = pd.concat([df_3xx_5xx, df_no_match[['URL - Source', 'Status Code']].rename(columns={'URL - Source': 'Address'})], ignore_index=True)
+                df_3xx_5xx = pd.concat([df_3xx_5xx, df_no_match_export], ignore_index=True)
+                
+                # Rimuovi duplicati
+                df_3xx_5xx.drop_duplicates(subset='Address', inplace=True)
+                
                 st.info(f"📋 {len(df_no_match)} URL senza match valido nella stessa lingua → spostati in 'non redirectable'")
         
         # Calcolo SECONDO match migliore
