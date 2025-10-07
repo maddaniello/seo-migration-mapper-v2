@@ -563,7 +563,62 @@ class URLMigrationMapper:
                 df_final.loc[mask, 'Highest Match Source Text'] = df_final.loc[mask, f'From ({col_name})']
                 df_final.loc[mask, 'Highest Match Destination Text'] = df_final.loc[mask, f'To {col_name}']
         
+        # VALIDAZIONE LINGUA: rimuovi match cross-lingua se language matching è attivo
+        if use_language_matching and 'language' in df_final.columns:
+            print("Validazione match per lingua...")
+            
+            # Per ogni URL matchata, verifica la lingua
+            def validate_language_match(row):
+                source_lang = row.get('language', 'unknown')
+                matched_url = row.get('Best Matching URL', '')
+                
+                if pd.isna(matched_url) or matched_url == '':
+                    return matched_url
+                
+                # Trova la lingua dell'URL di destinazione
+                target_row = df_staging[df_staging['Address'] == matched_url]
+                
+                if len(target_row) > 0 and 'language' in target_row.columns:
+                    target_lang = target_row.iloc[0]['language']
+                    
+                    # Se le lingue sono diverse, invalida il match
+                    if source_lang != target_lang:
+                        return ''  # Rimuovi il match
+                
+                return matched_url
+            
+            # Applica validazione
+            df_final['Best Matching URL'] = df_final.apply(validate_language_match, axis=1)
+            
+            # Azzera similarity per match invalidati
+            invalid_mask = (df_final['Best Matching URL'] == '') | (df_final['Best Matching URL'].isna())
+            df_final.loc[invalid_mask, 'Highest Match Similarity'] = 0
+            df_final.loc[invalid_mask, 'Highest Match Source Text'] = ''
+            df_final.loc[invalid_mask, 'Highest Match Destination Text'] = ''
+            
+            # Conta match invalidati
+            invalidated_count = invalid_mask.sum()
+            if invalidated_count > 0:
+                st.warning(f"⚠️ {invalidated_count} match cross-lingua invalidati (verranno spostati in 'non redirectable')")
+                print(f"Match cross-lingua invalidati: {invalidated_count}")
+        
         df_final.drop_duplicates(subset="URL - Source", inplace=True)
+        
+        # SEPARA URL NON MATCHATE (per inserirle in non-redirectable se language matching attivo)
+        if use_language_matching:
+            # URL con similarity troppo bassa o senza match vanno in non-redirectable
+            no_match_mask = (
+                (df_final['Highest Match Similarity'].fillna(0) < self.min_similarity_threshold) |
+                (df_final['Best Matching URL'].isna()) |
+                (df_final['Best Matching URL'] == '')
+            )
+            
+            df_no_match = df_final[no_match_mask].copy()
+            
+            if len(df_no_match) > 0:
+                # Aggiungi alla lista di non redirectable
+                df_3xx_5xx = pd.concat([df_3xx_5xx, df_no_match[['URL - Source', 'Status Code']].rename(columns={'URL - Source': 'Address'})], ignore_index=True)
+                st.info(f"📋 {len(df_no_match)} URL senza match valido nella stessa lingua → spostati in 'non redirectable'")
         
         # Calcolo SECONDO match migliore
         df_final['Lowest Match On'] = df_final[similarity_cols].idxmin(axis=1)
